@@ -1,5 +1,32 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const assert = std.debug.assert;
+
+test {
+    const Rp = RPMemoryAllocator(.{
+        .backing_allocator = .{ .specific = &std.testing.allocator },
+        .configurable = true,
+        .enable_thread_cache = true,
+        .enable_global_cache = true,
+        .enable_unlimited_cache = true,
+    });
+    try Rp.init(.{});
+    defer Rp.deinit();
+    const allocator = Rp.allocator();
+
+    comptime var alignment: std.math.Log2Int(u29) = 1;
+    inline while ((1 << alignment) <= std.mem.page_size) : (alignment += 1) {
+        var size: usize = 0;
+        while (size < std.mem.page_size) : (size += 1) {
+            var mem = try allocator.alignedAlloc(u8, 1 << alignment, size);
+            var resize_to: usize = 1;
+            while (allocator.resize(mem, resize_to)) : (resize_to += 1) {
+                mem.len = resize_to;
+            }
+            allocator.free(mem);
+        }
+    }
+}
 
 pub const RPMemoryAllocatorConfig = struct {
     /// Define RPMALLOC_CONFIGURABLE to enable configuring sizes. Will introduce
@@ -11,6 +38,8 @@ pub const RPMemoryAllocatorConfig = struct {
     enable_thread_cache: bool = true,
     /// Enable global cache shared between all threads, requires thread cache
     enable_global_cache: bool = true,
+    /// Enable asserts
+    enable_asserts: bool = false,
     /// Disable unmapping memory pages (also enables unlimited cache)
     disable_unmap: bool = false,
     /// Enable unlimited global cache (no unmapping until finalization)
@@ -67,6 +96,267 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 },
             };
         }
+
+        /// Initialize the allocator and setup global data.
+        pub fn init(config: rpmalloc_config_t) error{}!void {
+            if (_rpmalloc_initialized) {
+                rpmalloc_thread_initialize();
+                return;
+            }
+            _rpmalloc_initialized = true;
+            _memory_config = config;
+
+            if (config.backing_allocator) |ally| {
+                backing_allocator_mut.* = ally;
+            } else if (cfg.backing_allocator == .runtime) {
+                @panic("Must specify backing allocator with runtime allocator");
+            }
+
+            const windows_system_info = blk: {
+                if (builtin.os.tag != .windows) break :blk;
+                if (!builtin.os.version_range.windows.isAtLeast(.win2k)) break :blk;
+
+                var windows_system_info: std.os.windows.SYSTEM_INFO = std.mem.zeroInit(std.os.windows.SYSTEM_INFO, .{});
+                std.os.windows.kernel32.GetSystemInfo(&windows_system_info);
+                break :blk windows_system_info;
+            };
+
+            if (builtin.os.tag == .windows) {
+                _memory_map_granularity = @intCast(usize, windows_system_info.dwAllocationGranularity);
+            } else {
+                _memory_map_granularity = std.mem.page_size; // TODO: should we query system info here?
+            }
+
+            if (RPMALLOC_CONFIGURABLE) {
+                _memory_page_size = _memory_config.page_size;
+            } else {
+                _memory_page_size = 0;
+            }
+
+            _memory_huge_pages = false;
+            if (_memory_page_size == 0) {
+                if (builtin.os.tag == .windows) {
+                    _memory_page_size = windows_system_info.dwPageSize;
+                } else {
+                    _memory_page_size = _memory_map_granularity;
+                    if (_memory_config.enable_huge_pages) {
+                        if (builtin.os.tag == .linux) {
+                            const huge_page_size: usize = huge_pg_sz: {
+                                var line_buf: [128]u8 = undefined;
+                                const line: []const u8 = line: {
+                                    const meminfo_unbuffered = std.fs.openFileAbsolute("/proc/meminfo", std.fs.File.OpenFlags{}) catch break :huge_pg_sz 0;
+                                    defer meminfo_unbuffered.close();
+
+                                    var meminfo_buffered_state = std.io.bufferedReader(meminfo_unbuffered.reader());
+                                    const meminfo = meminfo_buffered_state.reader();
+
+                                    while (true) {
+                                        const is_expected = meminfo.isBytes("Hugepagesize:") catch break :huge_pg_sz 0;
+                                        if (is_expected) break;
+                                    } else break :huge_pg_sz 0;
+
+                                    break :line meminfo.readUntilDelimiter(line_buf[0..], '\n') catch break :huge_pg_sz 0;
+                                };
+                                // that would be sus
+                                if (!std.mem.endsWith(u8, line, " kB\n")) break :huge_pg_sz 0;
+
+                                const digits: []const u8 = "0123456789";
+                                const num_start = std.mem.indexOfAny(u8, line, digits) orelse break :huge_pg_sz 0;
+                                const num_end = num_start + std.mem.lastIndexOfAny(u8, line[num_start..], digits).? + 1;
+                                const val = 1024 * (std.fmt.parseUnsigned(usize, line[num_start..num_end], 10) catch break :huge_pg_sz 0);
+                                // non-power of 2 would be sus
+                                if (@popCount(val) != 1) break :huge_pg_sz 0;
+                                break :huge_pg_sz val;
+                            };
+
+                            if (huge_page_size != 0) {
+                                _memory_huge_pages = true;
+                                _memory_page_size = huge_page_size;
+                                _memory_map_granularity = huge_page_size;
+                            }
+                        } else if (builtin.os.tag == .freebsd) {
+                            var rc: c_int = undefined;
+                            var sz: usize = @sizeOf(@TypeOf(rc));
+
+                            if (std.os.freebsd.sysctlbyname("vm.pmap.pg_ps_enabled", &rc, &sz, null, 0) == 0 and rc == 1) {
+                                _memory_huge_pages = 1;
+                                _memory_page_size = 2 * 1024 * 1024;
+                                _memory_map_granularity = _memory_page_size;
+                            }
+                        } else if (builtin.os.tag.isDarwin() or builtin.os.tag == .netbsd) {
+                            _memory_huge_pages = true;
+                            _memory_page_size = 2 * 1024 * 1024;
+                            _memory_map_granularity = _memory_page_size;
+                        }
+                    }
+                }
+            } else {
+                if (_memory_config.enable_huge_pages) {
+                    _memory_huge_pages = true;
+                }
+            }
+
+            if (builtin.os.tag == .windows) {
+                if (_memory_config.enable_huge_pages) {
+                    var token: ?std.os.windows.HANDLE = null;
+                    defer if (token) |tok| std.os.windows.CloseHandle(tok);
+
+                    var large_page_minimum: usize = GetLargePageMinimum();
+                    if (large_page_minimum != 0) {
+                        OpenProcessToken(std.os.windows.kernel32.GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token);
+                    }
+                    if (token != null) {
+                        var luid: LUID = undefined;
+                        if (LookupPrivilegeValue(0, SE_LOCK_MEMORY_NAME, &luid)) {
+                            var token_privileges: TOKEN_PRIVILEGES = std.mem.zeroInit(TOKEN_PRIVILEGES, .{});
+                            token_privileges.PrivilegeCount = 1;
+                            token_privileges.Privileges[0].Luid = luid;
+                            token_privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                            if (AdjustTokenPrivileges(token, std.os.windows.FALSE, &token_privileges, 0, 0, 0)) {
+                                if (std.os.windows.user32.GetLastError() == .SUCCESS) {
+                                    _memory_huge_pages = true;
+                                }
+                            }
+                        }
+                    }
+                    if (_memory_huge_pages) {
+                        if (large_page_minimum > _memory_page_size) {
+                            _memory_page_size = large_page_minimum;
+                        }
+                        if (large_page_minimum > _memory_map_granularity) {
+                            _memory_map_granularity = large_page_minimum;
+                        }
+                    }
+                }
+            }
+
+            const min_span_size: usize = 256;
+            const max_page_size: usize = if (std.math.maxInt(uptr_t) > 0xFFFF_FFFF)
+                (4096 * 1024 * 1024)
+            else
+                (4 * 1024 * 1024);
+            _memory_page_size = std.math.clamp(_memory_page_size, min_span_size, max_page_size);
+            _memory_page_size_shift = 0;
+            var page_size_bit: usize = _memory_page_size;
+            while (page_size_bit != 1) {
+                _memory_page_size_shift += 1;
+                page_size_bit >>= 1;
+            }
+            _memory_page_size = @as(usize, 1) << _memory_page_size_shift;
+
+            if (RPMALLOC_CONFIGURABLE) {
+                if (_memory_config.span_size == 0) {
+                    _memory_span_size.* = _memory_default_span_size;
+                    _memory_span_size_shift.* = _memory_default_span_size_shift;
+                    _memory_span_mask.* = _memory_default_span_mask();
+                } else {
+                    var span_size: usize = _memory_config.span_size;
+                    if (span_size > (256 * 1024)) {
+                        span_size = (256 * 1024);
+                    }
+                    _memory_span_size.* = 4096;
+                    _memory_span_size_shift.* = 12;
+                    while (_memory_span_size.* < span_size) {
+                        _memory_span_size.* <<= 1;
+                        _memory_span_size_shift.* += 1;
+                    }
+                    _memory_span_mask.* = ~@as(uptr_t, _memory_span_size.* - 1);
+                }
+            }
+
+            _memory_span_map_count = if (_memory_config.span_map_count != 0) _memory_config.span_map_count else DEFAULT_SPAN_MAP_COUNT;
+            if ((_memory_span_size.* * _memory_span_map_count) < _memory_page_size) {
+                _memory_span_map_count = (_memory_page_size / _memory_span_size.*);
+            }
+            if ((_memory_page_size >= _memory_span_size.*) and ((_memory_span_map_count * _memory_span_size.*) % _memory_page_size) != 0) {
+                _memory_span_map_count = (_memory_page_size / _memory_span_size.*);
+            }
+            _memory_heap_reserve_count = if (_memory_span_map_count > DEFAULT_SPAN_MAP_COUNT) DEFAULT_SPAN_MAP_COUNT else _memory_span_map_count;
+
+            _memory_config.page_size = _memory_page_size;
+            _memory_config.span_size = _memory_span_size.*;
+            _memory_config.span_map_count = _memory_span_map_count;
+            _memory_config.enable_huge_pages = _memory_huge_pages;
+
+            if (builtin.os.tag == .windows and (builtin.link_mode != .Dynamic)) {
+                fls_key = FlsAlloc(&_rpmalloc_thread_destructor);
+            }
+
+            // Setup all small and medium size classes
+            var iclass: usize = 0;
+            _memory_size_class[iclass].block_size = SMALL_GRANULARITY;
+            _rpmalloc_adjust_size_class(iclass);
+            iclass = 1;
+            while (iclass < SMALL_CLASS_COUNT) : (iclass += 1) {
+                const size: usize = iclass * SMALL_GRANULARITY;
+                _memory_size_class[iclass].block_size = @intCast(u32, size);
+                _rpmalloc_adjust_size_class(iclass);
+            }
+
+            //At least two blocks per span, then fall back to large allocations
+            _memory_medium_size_limit = (_memory_span_size.* - SPAN_HEADER_SIZE) >> 1;
+            if (_memory_medium_size_limit > MEDIUM_SIZE_LIMIT) {
+                _memory_medium_size_limit = MEDIUM_SIZE_LIMIT;
+            }
+            iclass = 0;
+            while (iclass < MEDIUM_CLASS_COUNT) : (iclass += 1) {
+                const size: usize = SMALL_SIZE_LIMIT + ((iclass + 1) * MEDIUM_GRANULARITY);
+                if (size > _memory_medium_size_limit) break;
+                _memory_size_class[SMALL_CLASS_COUNT + iclass].block_size = @intCast(u32, size);
+                _rpmalloc_adjust_size_class(SMALL_CLASS_COUNT + iclass);
+            }
+
+            _memory_orphan_heaps = null;
+            _memory_heaps = .{null} ** _memory_heaps.len;
+            releaseLock(&_memory_global_lock);
+
+            //Initialize this thread
+            rpmalloc_thread_initialize();
+        }
+
+        /// Finalize the allocator
+        pub fn deinit() void {
+            rpmalloc_thread_finalize(true);
+            //rpmalloc_dump_statistics(stdout);
+
+            if (_memory_global_reserve != null) {
+                _ = atomic_add32(&_memory_global_reserve_master.?.remaining_spans, -@intCast(i32, _memory_global_reserve_count));
+                _memory_global_reserve_master = null;
+                _memory_global_reserve_count = 0;
+                _memory_global_reserve = null;
+            }
+            releaseLock(&_memory_global_lock);
+
+            // Free all thread caches and fully free spans
+            {
+                var list_idx: usize = 0;
+                while (list_idx < HEAP_ARRAY_SIZE) : (list_idx += 1) {
+                    var maybe_heap: ?*heap_t = _memory_heaps[list_idx];
+                    while (maybe_heap) |heap| {
+                        const next_heap: ?*heap_t = heap.next_heap;
+                        heap.finalize = 1;
+                        _rpmalloc_heap_global_finalize(heap);
+                        maybe_heap = next_heap;
+                    }
+                }
+            }
+
+            if (ENABLE_GLOBAL_CACHE) {
+                //Free global caches
+                var iclass: usize = 0;
+                while (iclass < LARGE_CLASS_COUNT) : (iclass += 1) {
+                    _rpmalloc_global_cache_finalize(&_memory_span_cache[iclass]);
+                }
+            }
+
+            if (is_windows_and_not_dynamic) {
+                FlsFree(fls_key);
+                fls_key = 0;
+            }
+
+            _rpmalloc_initialized = false;
+        }
+
         fn alloc(state_ptr: *anyopaque, len: usize, ptr_align: u8, ret_addr: usize) ?[*]u8 {
             _ = state_ptr;
             _ = ret_addr;
@@ -75,7 +365,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             const result_ptr = _rpmalloc_aligned_allocate(heap, std.math.shl(usize, 1, ptr_align), len) orelse return null;
 
             const usable_size = _rpmalloc_usable_size(result_ptr);
-            std.debug.assert(len <= usable_size);
+            assert(len <= usable_size);
             const result: []u8 = @ptrCast([*]u8, result_ptr)[0..len];
             @memset(result.ptr, undefined, result.len);
             return result.ptr;
@@ -85,8 +375,8 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             _ = ret_addr;
 
             const usable_size = _rpmalloc_usable_size(buf.ptr);
-            std.debug.assert(buf.len <= usable_size);
-            std.debug.assert(std.mem.isAligned(@ptrToInt(buf.ptr), std.math.shl(usize, 1, buf_align)));
+            assert(buf.len <= usable_size);
+            assert(std.mem.isAligned(@ptrToInt(buf.ptr), std.math.shl(usize, 1, buf_align)));
 
             return usable_size >= new_len;
         }
@@ -98,6 +388,11 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         var fls_key = if (is_windows_and_not_dynamic) @as(std.os.windows.DWORD, 0) else {};
+
+        inline fn rpmalloc_assert(truth: bool, message: []const u8) void {
+            if (cfg.enable_asserts and !truth) @panic(message);
+        }
+
         comptime {
             if ((SMALL_GRANULARITY & (SMALL_GRANULARITY - 1)) != 0) @compileError("Small granularity must be power of two");
             if ((SPAN_HEADER_SIZE & (SPAN_HEADER_SIZE - 1)) != 0) @compileError("Span header size must be power of two");
@@ -370,7 +665,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         fn _rpmalloc_thread_destructor(value: ?*anyopaque) callconv(.Stdcall) void {
-            comptime std.debug.assert(is_windows_and_not_dynamic);
+            comptime assert(is_windows_and_not_dynamic);
             if (value != null) {
                 rpmalloc_thread_finalize(1);
             }
@@ -447,7 +742,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             var address: *anyopaque = address_init orelse return;
             var offset = offset_init;
             var release = release_init;
-            // std.debug.assert(release != 0);
+            assert(release != 0); // I don't think we want to do partial unmappings
             rpmalloc_assert(release != 0 or (offset == 0), "Invalid unmap size");
             rpmalloc_assert(release == 0 or (release >= _memory_page_size), "Invalid unmap size");
             rpmalloc_assert(size >= _memory_page_size, "Invalid unmap size");
@@ -460,13 +755,6 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 }
             }
             if (!DISABLE_UNMAP) {
-                // if (builtin.os.tag == .windows) {
-                //     if (std.os.windows.kernel32.VirtualFree(address, if (release != 0) 0 else size, if (release != 0) std.os.windows.MEM_RELEASE else std.os.windows.MEM_DECOMMIT) != 0) {
-                //         rpmalloc_assert(false, "Failed to unmap virtual memory block");
-                //     }
-                // } else if (release != 0) {
-                //     rpmalloc_assert(std.os.linux.munmap(@ptrCast([*]const u8, address), release) == 0, "Failed to unmap virtual memory block");
-                // }
                 backing_allocator.rawFree(@ptrCast([*]u8, address)[0..release], _memory_page_size_shift, @returnAddress());
             }
         }
@@ -476,7 +764,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             rpmalloc_assert(subspan != master or subspan.flags.master, "Span master pointer and/or flag mismatch");
             if (subspan != master) {
                 subspan.flags = .{ .subspan = true };
-                subspan.offset_from_master = @intCast(u32, @bitCast(uptr_t, pointer_diff(subspan, master)) >> _memory_span_size_shift.*);
+                subspan.offset_from_master = @intCast(u32, std.math.shr(uptr_t, @bitCast(uptr_t, pointer_diff(subspan, master)), _memory_span_size_shift.*));
                 subspan.align_offset = 0;
             }
             subspan.span_count = @intCast(u32, span_count);
@@ -488,7 +776,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             _rpmalloc_span_mark_as_subspan_unless_master(_memory_global_reserve_master.?, span.?, span_count);
             _memory_global_reserve_count -= span_count;
             if (_memory_global_reserve_count != 0) {
-                _memory_global_reserve = @ptrCast(?*span_t, @alignCast(@alignOf(span_t), pointer_offset(span, @intCast(isize, span_count << _memory_span_size_shift.*))));
+                _memory_global_reserve = @ptrCast(?*span_t, @alignCast(@alignOf(span_t), pointer_offset(span, @intCast(isize, std.math.shl(usize, span_count, _memory_span_size_shift.*)))));
             } else {
                 _memory_global_reserve = null;
             }
@@ -565,7 +853,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             span.span_count = @intCast(u32, span_count);
             span.align_offset = @intCast(u32, align_offset);
             span.flags = .{ .master = true };
-            std.debug.assert(@bitCast(u32, span.flags) == 1);
+            assert(@bitCast(u32, span.flags) == 1);
             atomic_store32(&span.remaining_spans, @intCast(i32, total_span_count));
         }
 
@@ -616,7 +904,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                     span = _rpmalloc_global_get_reserved_spans(reserve_count);
                     if (span != null) {
                         if (reserve_count > span_count) {
-                            const reserved_span: *span_t = @ptrCast(*span_t, @alignCast(@alignOf(span_t), pointer_offset(span, span_count << _memory_span_size_shift.*).?));
+                            const reserved_span: *span_t = @ptrCast(*span_t, @alignCast(@alignOf(span_t), pointer_offset(span, std.math.shl(usize, span_count, _memory_span_size_shift.*)).?));
                             _rpmalloc_heap_set_reserved_spans(heap, _memory_global_reserve_master, reserved_span, reserve_count - span_count);
                         }
                         // Already marked as subspan in _rpmalloc_global_get_reserved_spans
@@ -648,10 +936,13 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
 
             const span_count: usize = span.span_count;
             if (!is_master) {
-                // Directly unmap subspans (unless huge pages, in which case we defer and unmap entire page range with master)
                 rpmalloc_assert(span.align_offset == 0, "Span align offset corrupted");
+
+                // TODO: partial unmapping doesn't really work with a generic backing allocator.
+
+                // // Directly unmap subspans (unless huge pages, in which case we defer and unmap entire page range with master)
                 // if (_memory_span_size.* >= _memory_page_size) {
-                // _rpmalloc_unmap(span, span_count * _memory_span_size.*, span.align_offset, 0);
+                //     _rpmalloc_unmap(span, span_count * _memory_span_size.*, span.align_offset, 0);
                 // }
             } else {
                 // Special double flag to denote an unmapped master
@@ -794,7 +1085,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 heap.size_class[iclass].free_list = null;
                 span.used_count -= free_count;
             }
-            //If this assert triggers you have memory leaks
+            // If this assert triggers you have memory leaks
             rpmalloc_assert(span.list_size == span.used_count, "Memory leak detected");
             if (span.list_size == span.used_count) {
                 // This function only used for spans in double linked lists
@@ -811,7 +1102,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
 
         /// Finalize a global cache
         fn _rpmalloc_global_cache_finalize(cache: *global_cache_t) void {
-            comptime std.debug.assert(ENABLE_GLOBAL_CACHE);
+            comptime assert(ENABLE_GLOBAL_CACHE);
 
             acquireLock(&cache.lock);
             defer releaseLock(&cache.lock);
@@ -831,7 +1122,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         fn _rpmalloc_global_cache_insert_spans(span: [*]*span_t, span_count: usize, count: usize) void {
-            comptime std.debug.assert(ENABLE_GLOBAL_CACHE);
+            comptime assert(ENABLE_GLOBAL_CACHE);
 
             const cache_limit: usize = if (span_count == 1)
                 GLOBAL_CACHE_MULTIPLIER * MAX_THREAD_SPAN_CACHE
@@ -912,7 +1203,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         fn _rpmalloc_global_cache_extract_spans(span: [*]?*span_t, span_count: usize, count: usize) usize {
-            comptime std.debug.assert(ENABLE_GLOBAL_CACHE);
+            comptime assert(ENABLE_GLOBAL_CACHE);
 
             const cache: *global_cache_t = &_memory_span_cache[span_count - 1];
 
@@ -940,7 +1231,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             if (std.debug.runtime_safety) {
                 var ispan: usize = 0;
                 while (ispan < extract_count) : (ispan += 1) {
-                    std.debug.assert(span[ispan].?.span_count == span_count);
+                    assert(span[ispan].?.span_count == span_count);
                 }
             }
 
@@ -1399,7 +1690,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             if (heap.spans_reserved != 0) {
                 const span: *span_t = _rpmalloc_span_map_from_reserve(heap, heap.spans_reserved).?;
                 _rpmalloc_span_unmap(span);
-                std.debug.assert(heap.spans_reserved == 0);
+                assert(heap.spans_reserved == 0);
             }
 
             _rpmalloc_heap_cache_adopt_deferred(heap, null);
@@ -1542,7 +1833,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             // Since this function is never called if size > LARGE_SIZE_LIMIT
             // the span_count is guaranteed to be <= LARGE_CLASS_COUNT
             size += SPAN_HEADER_SIZE;
-            var span_count: usize = size >> _memory_span_size_shift.*;
+            var span_count: usize = std.math.shr(usize, size, _memory_span_size_shift.*);
             if (size & (_memory_span_size.* - 1) != 0) {
                 span_count += 1;
             }
@@ -1990,280 +2281,6 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             }
         }
 
-        /// Initialize the allocator and setup global data
-        pub inline fn init() !void {
-            if (_rpmalloc_initialized) {
-                rpmalloc_thread_initialize();
-                return;
-            }
-            return initConfig(null);
-        }
-
-        pub fn initConfig(maybe_config: ?rpmalloc_config_t) !void {
-            if (_rpmalloc_initialized) {
-                rpmalloc_thread_initialize();
-                return;
-            }
-            _rpmalloc_initialized = true;
-
-            if (maybe_config) |config| {
-                _memory_config = config;
-            } // otherwise it should already be initialised to all 0 values
-            if (cfg.backing_allocator == .runtime) success: {
-                fail: {
-                    const config = maybe_config orelse break :fail;
-                    backing_allocator_mut.* = config.backing_allocator orelse break :fail;
-                    break :success;
-                }
-                @panic("Must specify backing allocator with runtime allocator");
-            }
-
-            const windows_system_info = blk: {
-                if (builtin.os.tag != .windows) break :blk;
-                if (!builtin.os.version_range.windows.isAtLeast(.win2k)) break :blk;
-
-                var windows_system_info: std.os.windows.SYSTEM_INFO = std.mem.zeroInit(std.os.windows.SYSTEM_INFO, .{});
-                std.os.windows.kernel32.GetSystemInfo(&windows_system_info);
-                break :blk windows_system_info;
-            };
-
-            if (builtin.os.tag == .windows) {
-                _memory_map_granularity = @intCast(usize, windows_system_info.dwAllocationGranularity);
-            } else {
-                _memory_map_granularity = std.mem.page_size; // TODO: should we query system info here?
-            }
-
-            if (RPMALLOC_CONFIGURABLE) {
-                _memory_page_size = _memory_config.page_size;
-            } else {
-                _memory_page_size = 0;
-            }
-
-            _memory_huge_pages = false;
-            if (_memory_page_size == 0) {
-                if (builtin.os.tag == .windows) {
-                    _memory_page_size = windows_system_info.dwPageSize;
-                } else {
-                    _memory_page_size = _memory_map_granularity;
-                    if (_memory_config.enable_huge_pages) {
-                        if (builtin.os.tag == .linux) {
-                            const huge_page_size: usize = huge_pg_sz: {
-                                var line_buf: [128]u8 = undefined;
-                                const line: []const u8 = line: {
-                                    const meminfo_unbuffered = std.fs.openFileAbsolute("/proc/meminfo", std.fs.File.OpenFlags{}) catch break :huge_pg_sz 0;
-                                    defer meminfo_unbuffered.close();
-
-                                    var meminfo_buffered_state = std.io.bufferedReader(meminfo_unbuffered.reader());
-                                    const meminfo = meminfo_buffered_state.reader();
-
-                                    while (true) {
-                                        const is_expected = meminfo.isBytes("Hugepagesize:") catch break :huge_pg_sz 0;
-                                        if (is_expected) break;
-                                    } else break :huge_pg_sz 0;
-
-                                    break :line meminfo.readUntilDelimiter(line_buf[0..], '\n') catch break :huge_pg_sz 0;
-                                };
-                                // that would be sus
-                                if (!std.mem.endsWith(u8, line, " kB\n")) break :huge_pg_sz 0;
-
-                                const digits: []const u8 = "0123456789";
-                                const num_start = std.mem.indexOfAny(u8, line, digits) orelse break :huge_pg_sz 0;
-                                const num_end = num_start + std.mem.lastIndexOfAny(u8, line[num_start..], digits).? + 1;
-                                const val = 1024 * (std.fmt.parseUnsigned(usize, line[num_start..num_end], 10) catch break :huge_pg_sz 0);
-                                // non-power of 2 would be sus
-                                if (@popCount(val) != 1) break :huge_pg_sz 0;
-                                break :huge_pg_sz val;
-                            };
-
-                            if (huge_page_size != 0) {
-                                _memory_huge_pages = true;
-                                _memory_page_size = huge_page_size;
-                                _memory_map_granularity = huge_page_size;
-                            }
-                        } else if (builtin.os.tag == .freebsd) {
-                            var rc: c_int = undefined;
-                            var sz: usize = @sizeOf(@TypeOf(rc));
-
-                            if (std.os.freebsd.sysctlbyname("vm.pmap.pg_ps_enabled", &rc, &sz, null, 0) == 0 and rc == 1) {
-                                _memory_huge_pages = 1;
-                                _memory_page_size = 2 * 1024 * 1024;
-                                _memory_map_granularity = _memory_page_size;
-                            }
-                        } else if (builtin.os.tag.isDarwin() or builtin.os.tag == .netbsd) {
-                            _memory_huge_pages = true;
-                            _memory_page_size = 2 * 1024 * 1024;
-                            _memory_map_granularity = _memory_page_size;
-                        }
-                    }
-                }
-            } else {
-                if (_memory_config.enable_huge_pages) {
-                    _memory_huge_pages = true;
-                }
-            }
-
-            if (builtin.os.tag == .windows) {
-                if (_memory_config.enable_huge_pages) {
-                    var token: ?std.os.windows.HANDLE = null;
-                    defer if (token) |tok| std.os.windows.CloseHandle(tok);
-
-                    var large_page_minimum: usize = GetLargePageMinimum();
-                    if (large_page_minimum != 0) {
-                        OpenProcessToken(std.os.windows.kernel32.GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token);
-                    }
-                    if (token != null) {
-                        var luid: LUID = undefined;
-                        if (LookupPrivilegeValue(0, SE_LOCK_MEMORY_NAME, &luid)) {
-                            var token_privileges: TOKEN_PRIVILEGES = std.mem.zeroInit(TOKEN_PRIVILEGES, .{});
-                            token_privileges.PrivilegeCount = 1;
-                            token_privileges.Privileges[0].Luid = luid;
-                            token_privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-                            if (AdjustTokenPrivileges(token, std.os.windows.FALSE, &token_privileges, 0, 0, 0)) {
-                                if (std.os.windows.user32.GetLastError() == .SUCCESS) {
-                                    _memory_huge_pages = true;
-                                }
-                            }
-                        }
-                    }
-                    if (_memory_huge_pages) {
-                        if (large_page_minimum > _memory_page_size) {
-                            _memory_page_size = large_page_minimum;
-                        }
-                        if (large_page_minimum > _memory_map_granularity) {
-                            _memory_map_granularity = large_page_minimum;
-                        }
-                    }
-                }
-            }
-
-            const min_span_size: usize = 256;
-            const max_page_size: usize = if (std.math.maxInt(uptr_t) > 0xFFFF_FFFF)
-                (4096 * 1024 * 1024)
-            else
-                (4 * 1024 * 1024);
-            _memory_page_size = std.math.clamp(_memory_page_size, min_span_size, max_page_size);
-            _memory_page_size_shift = 0;
-            var page_size_bit: usize = _memory_page_size;
-            while (page_size_bit != 1) {
-                _memory_page_size_shift += 1;
-                page_size_bit >>= 1;
-            }
-            _memory_page_size = @as(usize, 1) << _memory_page_size_shift;
-
-            if (RPMALLOC_CONFIGURABLE) {
-                if (_memory_config.span_size == 0) {
-                    _memory_span_size.* = _memory_default_span_size;
-                    _memory_span_size_shift.* = _memory_default_span_size_shift;
-                    _memory_span_mask.* = _memory_default_span_mask();
-                } else {
-                    var span_size: usize = _memory_config.span_size;
-                    if (span_size > (256 * 1024)) {
-                        span_size = (256 * 1024);
-                    }
-                    _memory_span_size.* = 4096;
-                    _memory_span_size_shift.* = 12;
-                    while (_memory_span_size.* < span_size) {
-                        _memory_span_size.* <<= 1;
-                        _memory_span_size_shift.* += 1;
-                    }
-                    _memory_span_mask.* = ~@as(uptr_t, _memory_span_size.* - 1);
-                }
-            }
-
-            _memory_span_map_count = if (_memory_config.span_map_count != 0) _memory_config.span_map_count else DEFAULT_SPAN_MAP_COUNT;
-            if ((_memory_span_size.* * _memory_span_map_count) < _memory_page_size) {
-                _memory_span_map_count = (_memory_page_size / _memory_span_size.*);
-            }
-            if ((_memory_page_size >= _memory_span_size.*) and ((_memory_span_map_count * _memory_span_size.*) % _memory_page_size) != 0) {
-                _memory_span_map_count = (_memory_page_size / _memory_span_size.*);
-            }
-            _memory_heap_reserve_count = if (_memory_span_map_count > DEFAULT_SPAN_MAP_COUNT) DEFAULT_SPAN_MAP_COUNT else _memory_span_map_count;
-
-            _memory_config.page_size = _memory_page_size;
-            _memory_config.span_size = _memory_span_size.*;
-            _memory_config.span_map_count = _memory_span_map_count;
-            _memory_config.enable_huge_pages = _memory_huge_pages;
-
-            if (builtin.os.tag == .windows and (builtin.link_mode != .Dynamic)) {
-                fls_key = FlsAlloc(&_rpmalloc_thread_destructor);
-            }
-
-            // Setup all small and medium size classes
-            var iclass: usize = 0;
-            _memory_size_class[iclass].block_size = SMALL_GRANULARITY;
-            _rpmalloc_adjust_size_class(iclass);
-            iclass = 1;
-            while (iclass < SMALL_CLASS_COUNT) : (iclass += 1) {
-                const size: usize = iclass * SMALL_GRANULARITY;
-                _memory_size_class[iclass].block_size = @intCast(u32, size);
-                _rpmalloc_adjust_size_class(iclass);
-            }
-
-            //At least two blocks per span, then fall back to large allocations
-            _memory_medium_size_limit = (_memory_span_size.* - SPAN_HEADER_SIZE) >> 1;
-            if (_memory_medium_size_limit > MEDIUM_SIZE_LIMIT) {
-                _memory_medium_size_limit = MEDIUM_SIZE_LIMIT;
-            }
-            iclass = 0;
-            while (iclass < MEDIUM_CLASS_COUNT) : (iclass += 1) {
-                const size: usize = SMALL_SIZE_LIMIT + ((iclass + 1) * MEDIUM_GRANULARITY);
-                if (size > _memory_medium_size_limit) break;
-                _memory_size_class[SMALL_CLASS_COUNT + iclass].block_size = @intCast(u32, size);
-                _rpmalloc_adjust_size_class(SMALL_CLASS_COUNT + iclass);
-            }
-
-            _memory_orphan_heaps = null;
-            _memory_heaps = .{null} ** _memory_heaps.len;
-            releaseLock(&_memory_global_lock);
-
-            //Initialize this thread
-            rpmalloc_thread_initialize();
-            return;
-        }
-
-        /// Finalize the allocator
-        pub fn deinit() void {
-            rpmalloc_thread_finalize(true);
-            //rpmalloc_dump_statistics(stdout);
-
-            if (_memory_global_reserve != null) {
-                _ = atomic_add32(&_memory_global_reserve_master.?.remaining_spans, -@intCast(i32, _memory_global_reserve_count));
-                _memory_global_reserve_master = null;
-                _memory_global_reserve_count = 0;
-                _memory_global_reserve = null;
-            }
-            releaseLock(&_memory_global_lock);
-
-            // Free all thread caches and fully free spans
-            {
-                var list_idx: usize = 0;
-                while (list_idx < HEAP_ARRAY_SIZE) : (list_idx += 1) {
-                    var maybe_heap: ?*heap_t = _memory_heaps[list_idx];
-                    while (maybe_heap) |heap| {
-                        const next_heap: ?*heap_t = heap.next_heap;
-                        heap.finalize = 1;
-                        _rpmalloc_heap_global_finalize(heap);
-                        maybe_heap = next_heap;
-                    }
-                }
-            }
-
-            if (ENABLE_GLOBAL_CACHE) {
-                //Free global caches
-                var iclass: usize = 0;
-                while (iclass < LARGE_CLASS_COUNT) : (iclass += 1) {
-                    _rpmalloc_global_cache_finalize(&_memory_span_cache[iclass]);
-                }
-            }
-
-            if (is_windows_and_not_dynamic) {
-                FlsFree(fls_key);
-                fls_key = 0;
-            }
-
-            _rpmalloc_initialized = false;
-        }
-
         /// Initialize thread, assign heap
         pub fn rpmalloc_thread_initialize() void {
             if (get_thread_heap_raw() == null) {
@@ -2369,8 +2386,8 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
 const uptr_t = std.meta.Int(.unsigned, @bitSizeOf(*anyopaque));
 const iptr_t = std.meta.Int(.signed, @bitSizeOf(*anyopaque));
 comptime {
-    std.debug.assert(std.meta.eql(@typeInfo(uptr_t).Int, @typeInfo(usize).Int));
-    std.debug.assert(std.meta.eql(@typeInfo(iptr_t).Int, @typeInfo(isize).Int));
+    assert(std.meta.eql(@typeInfo(uptr_t).Int, @typeInfo(usize).Int));
+    assert(std.meta.eql(@typeInfo(iptr_t).Int, @typeInfo(isize).Int));
 }
 
 /// `same as --x` in C.
@@ -2422,10 +2439,6 @@ const SE_LOCK_MEMORY_NAME = @compileError("windows stub");
 const TOKEN_PRIVILEGES = @compileError("windows stub");
 const SE_PRIVILEGE_ENABLED = @compileError("windows stub");
 const AdjustTokenPrivileges = @compileError("windows stub");
-
-inline fn rpmalloc_assert(truth: bool, message: []const u8) void {
-    if (!truth) @panic(message);
-}
 
 // typedef volatile _Atomic(int32_t) atomic32_t;
 const atomic32_t = i32;
