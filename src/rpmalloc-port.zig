@@ -194,9 +194,9 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             {
                 var list_idx: usize = 0;
                 while (list_idx < heap_array_size) : (list_idx += 1) {
-                    var maybe_heap: ?*heap_t = _memory_heaps[list_idx];
+                    var maybe_heap: ?*Heap = _memory_heaps[list_idx];
                     while (maybe_heap) |heap| {
-                        const next_heap: ?*heap_t = heap.next_heap;
+                        const next_heap: ?*Heap = heap.next_heap;
                         heap.finalize = 1;
                         _rpmalloc_heap_global_finalize(heap);
                         maybe_heap = next_heap;
@@ -224,7 +224,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             _ = state_ptr;
             _ = ret_addr;
 
-            const heap: *heap_t = get_thread_heap();
+            const heap: *Heap = get_thread_heap();
             const result_ptr = _rpmalloc_aligned_allocate(heap, std.math.shl(usize, 1, ptr_align), len) orelse return null;
 
             const usable_size = _rpmalloc_usable_size(result_ptr);
@@ -262,22 +262,21 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Maximum allocation size to avoid integer overflow
-        inline fn MAX_ALLOC_SIZE() @TypeOf(_memory_span_size.*) {
+        inline fn maxAllocSize() @TypeOf(_memory_span_size.*) {
             return std.math.maxInt(usize) - _memory_span_size.*;
         }
 
-        inline fn pointer_offset(ptr: ?*anyopaque, ofs: anytype) ?*anyopaque {
+        inline fn pointerOffset(ptr: ?*anyopaque, ofs: anytype) ?*anyopaque {
             const byte_ptr: [*]allowzero u8 = @ptrCast(?[*]u8, ptr);
             return if (ofs < 0)
                 byte_ptr - std.math.absCast(ofs)
             else
                 byte_ptr + std.math.absCast(ofs);
         }
-        inline fn pointer_diff(first: anytype, second: anytype) isize {
-            // _ = @TypeOf(first, second);
-            const first_int = @bitCast(isize, @ptrToInt(first));
-            const second_int = @bitCast(isize, @ptrToInt(second));
-            return first_int - second_int;
+        inline fn pointerDiff(first: anytype, second: anytype) iptr_t {
+            const first_int = @ptrToInt(first);
+            const second_int = @ptrToInt(second);
+            return @bitCast(iptr_t, first_int -% second_int);
         }
 
         /// A span can either represent a single span of memory pages with size declared by span_map_count configuration variable,
@@ -288,7 +287,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         /// superspan region is released and unmapped (on Windows for example, the entire superspan range has to be released
         /// in the same call to release the virtual memory range, but individual subranges can be decommitted individually
         /// to reduce physical memory use).
-        const span_t = extern struct {
+        const Span = extern struct {
             /// Free list
             free_list: ?*anyopaque,
             /// Total block count of size class
@@ -318,76 +317,74 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             /// Alignment offset
             align_offset: u32,
             /// Owning heap
-            heap: ?*heap_t,
+            heap: ?*Heap,
             /// Next span
-            next: ?*span_t,
+            next: ?*Span,
             /// Previous span
-            prev: ?*span_t,
+            prev: ?*Span,
         };
 
         comptime {
-            if (@sizeOf(span_t) > SPAN_HEADER_SIZE) @compileError("span size mismatch");
+            if (@sizeOf(Span) > SPAN_HEADER_SIZE) @compileError("span size mismatch");
         }
 
-        const span_cache_t = extern struct {
+        const SpanCache = extern struct {
             count: usize,
-            span: [MAX_THREAD_SPAN_CACHE]*span_t,
+            span: [MAX_THREAD_SPAN_CACHE]*Span,
         };
 
-        const span_large_cache_t = extern struct {
+        const SpanLargeCache = extern struct {
             count: usize,
-            span: [MAX_THREAD_SPAN_LARGE_CACHE]*span_t,
+            span: [MAX_THREAD_SPAN_LARGE_CACHE]*Span,
         };
 
-        const heap_size_class_t = extern struct {
+        const HeapSizeClass = extern struct {
             /// Free list of active span
             free_list: ?*anyopaque,
             /// Double linked list of partially used spans with free blocks.
             /// Previous span pointer in head points to tail span of list.
-            partial_span: ?*span_t,
+            partial_span: ?*Span,
             /// Early level cache of fully free spans
-            cache: ?*span_t,
+            cache: ?*Span,
         };
 
         /// Control structure for a heap, either a thread heap or a first class heap if enabled
-        const heap_t = extern struct {
+        const Heap = extern struct {
             /// Owning thread ID
             owner_thread: std.Thread.Id,
             /// Free lists for each size class
-            size_class: [SIZE_CLASS_COUNT]heap_size_class_t,
-
+            size_class: [SIZE_CLASS_COUNT]HeapSizeClass,
             /// Arrays of fully freed spans, single span
-            span_cache: if (enable_thread_cache) span_cache_t else [0]u8,
-
+            span_cache: if (enable_thread_cache) SpanCache else [0]u8,
             /// List of deferred free spans (single linked list)
-            span_free_deferred: ?*span_t, // atomic
+            span_free_deferred: ?*Span, // atomic
             /// Number of full spans
             full_span_count: usize,
             /// Mapped but unused spans
-            span_reserve: ?*span_t,
+            span_reserve: ?*Span,
             /// Master span for mapped but unused spans
-            span_reserve_master: ?*span_t,
+            span_reserve_master: ?*Span,
             /// Number of mapped but unused spans
             spans_reserved: u32,
             /// Child count
             child_count: i32, // atomic
             /// Next heap in id list
-            next_heap: ?*heap_t,
+            next_heap: ?*Heap,
             /// Next heap in orphan list
-            next_orphan: ?*heap_t,
+            next_orphan: ?*Heap,
             /// Heap ID
             id: i32,
             /// Finalization state flag
             finalize: i8,
             /// Master heap owning the memory pages
-            master_heap: ?*heap_t,
+            master_heap: ?*Heap,
 
             /// Arrays of fully freed spans, large spans with > 1 span count
-            span_large_cache: if (enable_thread_cache) ([LARGE_CLASS_COUNT - 1]span_large_cache_t) else [0]u8,
+            span_large_cache: if (enable_thread_cache) ([LARGE_CLASS_COUNT - 1]SpanLargeCache) else [0]u8,
         };
 
         /// Size class for defining a block size bucket
-        const size_class_t = extern struct {
+        const SizeClass = extern struct {
             /// Size of blocks in this class
             block_size: u32,
             /// Number of blocks in each chunk
@@ -397,18 +394,18 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         };
 
         comptime {
-            if (@sizeOf(size_class_t) != 8) @compileError("Size class size mismatch");
+            if (@sizeOf(SizeClass) != 8) @compileError("Size class size mismatch");
         }
 
-        const global_cache_t = extern struct {
+        const GlobalCache = extern struct {
             /// Cache lock
             lock: i32, // atomic
             /// Cache count
             count: u32,
             /// Cached spans
-            span: [global_cache_multiplier * MAX_THREAD_SPAN_CACHE]*span_t,
+            span: [global_cache_multiplier * MAX_THREAD_SPAN_CACHE]*Span,
             /// Unlimited cache overflow
-            overflow: ?*span_t,
+            overflow: ?*Span,
         };
 
         /// Default span size (64KiB)
@@ -460,7 +457,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         /// Number of spans to keep reserved in each heap
         var _memory_heap_reserve_count: usize = 0;
         /// Global size classes
-        var _memory_size_class: [SIZE_CLASS_COUNT]size_class_t = std.mem.zeroes([SIZE_CLASS_COUNT]size_class_t);
+        var _memory_size_class: [SIZE_CLASS_COUNT]SizeClass = std.mem.zeroes([SIZE_CLASS_COUNT]SizeClass);
         /// Run-time size limit of medium blocks
         var _memory_medium_size_limit: usize = 0;
         /// Heap ID counter
@@ -469,7 +466,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         const _memory_huge_pages: bool = false;
 
         /// Global span cache
-        var _memory_span_cache = if (enable_global_cache) ([_]global_cache_t{.{
+        var _memory_span_cache = if (enable_global_cache) ([_]GlobalCache{.{
             .lock = 0,
             .count = 0,
             .span = undefined,
@@ -477,27 +474,27 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }} ** LARGE_CLASS_COUNT) else @compileError("");
 
         /// Global reserved spans
-        var _memory_global_reserve: ?*span_t = null;
+        var _memory_global_reserve: ?*Span = null;
         /// Global reserved count
         var _memory_global_reserve_count: usize = 0;
         /// Global reserved master
-        var _memory_global_reserve_master: ?*span_t = null;
+        var _memory_global_reserve_master: ?*Span = null;
         /// All heaps
-        var _memory_heaps: [heap_array_size]?*heap_t = .{null} ** heap_array_size;
+        var _memory_heaps: [heap_array_size]?*Heap = .{null} ** heap_array_size;
         /// Used to restrict access to mapping memory for huge pages
-        var _memory_global_lock: i32 = 0; // atomic
+        var _memory_global_lock: atomic32_t = 0; // atomic
         /// Orphaned heaps
-        var _memory_orphan_heaps: ?*heap_t = null;
+        var _memory_orphan_heaps: ?*Heap = null;
 
         /// Thread local heap and ID
-        threadlocal var _memory_thread_heap: ?*heap_t = null;
+        threadlocal var _memory_thread_heap: ?*Heap = null;
 
-        inline fn get_thread_heap_raw() ?*heap_t {
+        inline fn get_thread_heap_raw() ?*Heap {
             return _memory_thread_heap;
         }
 
         /// Get the current thread heap
-        inline fn get_thread_heap() *heap_t {
+        inline fn get_thread_heap() *Heap {
             return get_thread_heap_raw().?;
         }
 
@@ -507,7 +504,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Set the current thread heap
-        inline fn set_thread_heap(heap: ?*heap_t) void {
+        inline fn set_thread_heap(heap: ?*Heap) void {
             _memory_thread_heap = heap;
             if (heap) |h| {
                 h.owner_thread = get_thread_id();
@@ -580,7 +577,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 rpmalloc_assert(final_padding <= _memory_span_size.*, "Internal failure in padding");
                 rpmalloc_assert(final_padding <= padding, "Internal failure in padding");
                 rpmalloc_assert(final_padding % 8 == 0, "Internal failure in padding");
-                ptr = pointer_offset(ptr, final_padding).?;
+                ptr = pointerOffset(ptr, final_padding).?;
                 offset.* = final_padding >> 3;
             }
             rpmalloc_assert(
@@ -601,7 +598,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             rpmalloc_assert(size >= _memory_page_size, "Invalid unmap size");
             if (release != 0 and offset != 0) {
                 offset <<= 3;
-                address = pointer_offset(address, -@intCast(isize, offset)).?;
+                address = pointerOffset(address, -@intCast(isize, offset)).?;
                 if ((release >= _memory_span_size.*) and (_memory_span_size.* > _memory_map_granularity)) {
                     // Padding is always one span size
                     release += _memory_span_size.*;
@@ -613,23 +610,23 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Declare the span to be a subspan and store distance from master span and span count
-        fn _rpmalloc_span_mark_as_subspan_unless_master(master: *span_t, subspan: *span_t, span_count: usize) void {
+        fn _rpmalloc_span_mark_as_subspan_unless_master(master: *Span, subspan: *Span, span_count: usize) void {
             rpmalloc_assert(subspan != master or subspan.flags.master, "Span master pointer and/or flag mismatch");
             if (subspan != master) {
                 subspan.flags = .{ .subspan = true };
-                subspan.offset_from_master = @intCast(u32, std.math.shr(uptr_t, @bitCast(uptr_t, pointer_diff(subspan, master)), _memory_span_size_shift.*));
+                subspan.offset_from_master = @intCast(u32, std.math.shr(uptr_t, @bitCast(uptr_t, pointerDiff(subspan, master)), _memory_span_size_shift.*));
                 subspan.align_offset = 0;
             }
             subspan.span_count = @intCast(u32, span_count);
         }
 
         /// Use global reserved spans to fulfill a memory map request (reserve size must be checked by caller)
-        fn _rpmalloc_global_get_reserved_spans(span_count: usize) ?*span_t {
-            const span: ?*span_t = _memory_global_reserve;
+        fn _rpmalloc_global_get_reserved_spans(span_count: usize) ?*Span {
+            const span: ?*Span = _memory_global_reserve;
             _rpmalloc_span_mark_as_subspan_unless_master(_memory_global_reserve_master.?, span.?, span_count);
             _memory_global_reserve_count -= span_count;
             if (_memory_global_reserve_count != 0) {
-                _memory_global_reserve = @ptrCast(?*span_t, @alignCast(@alignOf(span_t), pointer_offset(span, @intCast(isize, std.math.shl(usize, span_count, _memory_span_size_shift.*)))));
+                _memory_global_reserve = @ptrCast(?*Span, @alignCast(@alignOf(Span), pointerOffset(span, @intCast(isize, std.math.shl(usize, span_count, _memory_span_size_shift.*)))));
             } else {
                 _memory_global_reserve = null;
             }
@@ -637,7 +634,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Store the given spans as global reserve (must only be called from within new heap allocation, not thread safe)
-        fn _rpmalloc_global_set_reserved_spans(master: *span_t, reserve: *span_t, reserve_span_count: usize) void {
+        fn _rpmalloc_global_set_reserved_spans(master: *Span, reserve: *Span, reserve_span_count: usize) void {
             _memory_global_reserve_master = master;
             _memory_global_reserve_count = reserve_span_count;
             _memory_global_reserve = reserve;
@@ -646,7 +643,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         // Span linked list management
 
         /// Add a span to double linked list at the head
-        fn _rpmalloc_span_double_link_list_add(head: *?*span_t, span: *span_t) void {
+        fn _rpmalloc_span_double_link_list_add(head: *?*Span, span: *Span) void {
             if (head.*) |h| {
                 h.prev = span;
             }
@@ -655,14 +652,14 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Pop head span from double linked list
-        fn _rpmalloc_span_double_link_list_pop_head(head: **span_t, span: *span_t) void {
+        fn _rpmalloc_span_double_link_list_pop_head(head: **Span, span: *Span) void {
             rpmalloc_assert(head.* == span, "Linked list corrupted");
-            const old_head: *span_t = head.*;
+            const old_head: *Span = head.*;
             head.* = old_head.next.?;
         }
 
         /// Remove a span from double linked list
-        fn _rpmalloc_span_double_link_list_remove(maybe_head: *?*span_t, span: *span_t) void {
+        fn _rpmalloc_span_double_link_list_remove(maybe_head: *?*Span, span: *Span) void {
             rpmalloc_assert(maybe_head.* != null, "Linked list corrupted");
             const head = maybe_head;
             if (head.* == span) {
@@ -670,10 +667,11 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 return;
             }
 
-            const maybe_next_span: ?*span_t = span.next;
-            const prev_span: *span_t = span.prev.?;
+            const maybe_next_span: ?*Span = span.next;
+            const prev_span: *Span = span.prev.?;
             prev_span.next = maybe_next_span;
-            if (EXPECTED(maybe_next_span)) |next_span| {
+            if (maybe_next_span) |next_span| {
+                @setCold(false);
                 next_span.prev = prev_span;
             }
         }
@@ -681,10 +679,10 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         // Span control
 
         /// Use reserved spans to fulfill a memory map request (reserve size must be checked by caller)
-        fn _rpmalloc_span_map_from_reserve(heap: *heap_t, span_count: usize) ?*span_t {
+        fn _rpmalloc_span_map_from_reserve(heap: *Heap, span_count: usize) ?*Span {
             //Update the heap span reserve
-            const span: ?*span_t = heap.span_reserve;
-            heap.span_reserve = @ptrCast(?*span_t, @alignCast(@alignOf(span_t), pointer_offset(span, span_count * _memory_span_size.*)));
+            const span: ?*Span = heap.span_reserve;
+            heap.span_reserve = @ptrCast(?*Span, @alignCast(@alignOf(Span), pointerOffset(span, span_count * _memory_span_size.*)));
             heap.spans_reserved -= @intCast(u32, span_count);
             _rpmalloc_span_mark_as_subspan_unless_master(heap.span_reserve_master.?, span.?, span_count);
             return span;
@@ -700,8 +698,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Setup a newly mapped span
-        fn _rpmalloc_span_initialize(span: *span_t, total_span_count: usize, span_count: usize, align_offset: usize) void {
-            // span.* = std.mem.zeroes(span_t);
+        fn _rpmalloc_span_initialize(span: *Span, total_span_count: usize, span_count: usize, align_offset: usize) void {
             span.total_spans = @intCast(u32, total_span_count);
             span.span_count = @intCast(u32, span_count);
             span.align_offset = @intCast(u32, align_offset);
@@ -711,15 +708,15 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Map an aligned set of spans, taking configured mapping granularity and the page size into account
-        fn _rpmalloc_span_map_aligned_count(heap: *heap_t, span_count: usize) ?*span_t {
+        fn _rpmalloc_span_map_aligned_count(heap: *Heap, span_count: usize) ?*Span {
             // If we already have some, but not enough, reserved spans, release those to heap cache and map a new
             // full set of spans. Otherwise we would waste memory if page size > span size (huge pages)
             const aligned_span_count: usize = _rpmalloc_span_align_count(span_count);
             var align_offset: usize = 0;
-            const span: *span_t = @ptrCast(?*span_t, @alignCast(@alignOf(span_t), _rpmalloc_mmap(aligned_span_count * _memory_span_size.*, &align_offset))) orelse return null;
+            const span: *Span = @ptrCast(?*Span, @alignCast(@alignOf(Span), _rpmalloc_mmap(aligned_span_count * _memory_span_size.*, &align_offset))) orelse return null;
             _rpmalloc_span_initialize(span, aligned_span_count, span_count, align_offset);
             if (aligned_span_count > span_count) {
-                const reserved_spans: *span_t = @ptrCast(*span_t, @alignCast(@alignOf(span_t), pointer_offset(span, span_count * _memory_span_size.*).?));
+                const reserved_spans: *Span = @ptrCast(*Span, @alignCast(@alignOf(Span), pointerOffset(span, span_count * _memory_span_size.*).?));
                 var reserved_count: usize = aligned_span_count - span_count;
                 if (heap.spans_reserved != 0) {
                     _rpmalloc_span_mark_as_subspan_unless_master(heap.span_reserve_master.?, heap.span_reserve.?, heap.spans_reserved);
@@ -730,7 +727,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                     rpmalloc_assert(atomic_load32(&_memory_global_lock) == 1, "Global spin lock not held as expected");
                     const remain_count: usize = reserved_count - _memory_heap_reserve_count;
                     reserved_count = _memory_heap_reserve_count;
-                    const remain_span: *span_t = @ptrCast(*span_t, @alignCast(@alignOf(span_t), pointer_offset(reserved_spans, reserved_count * _memory_span_size.*).?));
+                    const remain_span: *Span = @ptrCast(*Span, @alignCast(@alignOf(Span), pointerOffset(reserved_spans, reserved_count * _memory_span_size.*).?));
                     if (_memory_global_reserve != null) {
                         _rpmalloc_span_mark_as_subspan_unless_master(_memory_global_reserve_master.?, _memory_global_reserve.?, _memory_global_reserve_count);
                         _rpmalloc_span_unmap(_memory_global_reserve.?);
@@ -743,10 +740,11 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Map in memory pages for the given number of spans (or use previously reserved pages)
-        fn _rpmalloc_span_map(heap: *heap_t, span_count: usize) ?*span_t {
+        fn _rpmalloc_span_map(heap: *Heap, span_count: usize) ?*Span {
+            @setCold(true);
             if (span_count <= heap.spans_reserved)
                 return _rpmalloc_span_map_from_reserve(heap, span_count);
-            var span: ?*span_t = null;
+            var span: ?*Span = null;
             const use_global_reserve: bool = (_memory_page_size > _memory_span_size.*) or (_memory_span_map_count > _memory_heap_reserve_count);
             if (use_global_reserve) {
                 // If huge pages, make sure only one thread maps more memory to avoid bloat
@@ -757,7 +755,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                     span = _rpmalloc_global_get_reserved_spans(reserve_count);
                     if (span != null) {
                         if (reserve_count > span_count) {
-                            const reserved_span: *span_t = @ptrCast(*span_t, @alignCast(@alignOf(span_t), pointer_offset(span, std.math.shl(usize, span_count, _memory_span_size_shift.*)).?));
+                            const reserved_span: *Span = @ptrCast(*Span, @alignCast(@alignOf(Span), pointerOffset(span, std.math.shl(usize, span_count, _memory_span_size_shift.*)).?));
                             _rpmalloc_heap_set_reserved_spans(heap, _memory_global_reserve_master, reserved_span, reserve_count - span_count);
                         }
                         // Already marked as subspan in _rpmalloc_global_get_reserved_spans
@@ -775,13 +773,13 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Unmap memory pages for the given number of spans (or mark as unused if no partial unmappings)
-        fn _rpmalloc_span_unmap(span: *span_t) void {
+        fn _rpmalloc_span_unmap(span: *Span) void {
             rpmalloc_assert(span.flags.master or span.flags.subspan, "Span flag corrupted");
             rpmalloc_assert(!span.flags.master or !span.flags.subspan, "Span flag corrupted");
 
             const is_master = span.flags.master;
-            const master: *span_t = if (!is_master)
-                @ptrCast(*span_t, @alignCast(@alignOf(span_t), pointer_offset(span, -@intCast(iptr_t, @as(uptr_t, span.offset_from_master) * _memory_span_size.*)).?))
+            const master: *Span = if (!is_master)
+                @ptrCast(*Span, @alignCast(@alignOf(Span), pointerOffset(span, -@intCast(iptr_t, @as(uptr_t, span.offset_from_master) * _memory_span_size.*)).?))
             else
                 span;
             rpmalloc_assert(is_master or span.flags.subspan, "Span flag corrupted");
@@ -817,7 +815,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Move the span (used for small or medium allocations) to the heap thread cache
-        fn _rpmalloc_span_release_to_cache(heap: *heap_t, span: *span_t) void {
+        fn _rpmalloc_span_release_to_cache(heap: *Heap, span: *Span) void {
             rpmalloc_assert(heap == span.heap, "Span heap pointer corrupted");
             rpmalloc_assert(span.size_class < SIZE_CLASS_COUNT, "Invalid span size class");
             rpmalloc_assert(span.span_count == 1, "Invalid span count");
@@ -838,23 +836,23 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             rpmalloc_assert(block_count != 0, "Internal failure");
             first_block.* = block_start;
             if (block_count > 1) {
-                var free_block: ?*anyopaque = pointer_offset(block_start, block_size);
-                var block_end: ?*anyopaque = pointer_offset(block_start, @as(usize, block_size) * block_count);
+                var free_block: ?*anyopaque = pointerOffset(block_start, block_size);
+                var block_end: ?*anyopaque = pointerOffset(block_start, @as(usize, block_size) * block_count);
                 //If block size is less than half a memory page, bound init to next memory page boundary
                 if (block_size < (_memory_page_size >> 1)) {
-                    const page_end: ?*anyopaque = pointer_offset(page_start, _memory_page_size);
+                    const page_end: ?*anyopaque = pointerOffset(page_start, _memory_page_size);
                     if (@ptrToInt(page_end) < @ptrToInt(block_end)) {
                         block_end = page_end;
                     }
                 }
                 list.* = free_block;
                 block_count = 2;
-                var next_block: ?*anyopaque = pointer_offset(free_block, block_size);
+                var next_block: ?*anyopaque = pointerOffset(free_block, block_size);
                 while (@ptrToInt(next_block) < @ptrToInt(block_end)) {
                     @ptrCast(*?*anyopaque, @alignCast(@alignOf(?*anyopaque), free_block)).* = next_block;
                     free_block = next_block;
                     block_count += 1;
-                    next_block = pointer_offset(next_block, block_size);
+                    next_block = pointerOffset(next_block, block_size);
                 }
                 @ptrCast(*?*anyopaque, @alignCast(@alignOf(?*anyopaque), free_block)).* = null;
             } else {
@@ -864,9 +862,9 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Initialize an unused span (from cache or mapped) to be new active span, putting the initial free list in heap class free list
-        fn _rpmalloc_span_initialize_new(heap: *heap_t, heap_size_class: *heap_size_class_t, span: *span_t, class_idx: u32) ?*anyopaque {
+        fn _rpmalloc_span_initialize_new(heap: *Heap, heap_size_class: *HeapSizeClass, span: *Span, class_idx: u32) ?*anyopaque {
             rpmalloc_assert(span.span_count == 1, "Internal failure");
-            const size_class: *size_class_t = &_memory_size_class[class_idx];
+            const size_class: *SizeClass = &_memory_size_class[class_idx];
             span.size_class = class_idx;
             span.heap = heap;
             // span.flags &= ~SPAN_FLAG_ALIGNED_BLOCKS;
@@ -884,7 +882,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
 
             //Setup free list. Only initialize one system page worth of free blocks in list
             var block: ?*anyopaque = undefined;
-            span.free_list_limit = free_list_partial_init(&heap_size_class.free_list, &block, span, pointer_offset(span, SPAN_HEADER_SIZE).?, size_class.block_count, size_class.block_size);
+            span.free_list_limit = free_list_partial_init(&heap_size_class.free_list, &block, span, pointerOffset(span, SPAN_HEADER_SIZE).?, size_class.block_count, size_class.block_size);
             //Link span as partial if there remains blocks to be initialized as free list, or full if fully initialized
             if (span.free_list_limit < span.block_count) {
                 _rpmalloc_span_double_link_list_add(&heap_size_class.partial_span, span);
@@ -896,7 +894,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             return block;
         }
 
-        fn _rpmalloc_span_extract_free_list_deferred(span: *span_t) void {
+        fn _rpmalloc_span_extract_free_list_deferred(span: *Span) void {
             // We need acquire semantics on the CAS operation since we are interested in the list size
             // Refer to _rpmalloc_deallocate_defer_small_or_medium for further comments on this dependency
             while (true) {
@@ -908,14 +906,14 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             atomic_store_ptr_release(&span.free_list_deferred, null);
         }
 
-        fn _rpmalloc_span_is_fully_utilized(span: *span_t) bool {
+        fn _rpmalloc_span_is_fully_utilized(span: *Span) bool {
             rpmalloc_assert(span.free_list_limit <= span.block_count, "Span free list corrupted");
             return span.free_list == null and (span.free_list_limit >= span.block_count);
         }
 
-        fn _rpmalloc_span_finalize(heap: *heap_t, iclass: usize, span: *span_t, list_head: ?*?*span_t) bool {
+        fn _rpmalloc_span_finalize(heap: *Heap, iclass: usize, span: *Span, list_head: ?*?*Span) bool {
             const free_list: ?*anyopaque = heap.size_class[iclass].free_list;
-            const class_span: ?*span_t = @intToPtr(?*span_t, @ptrToInt(free_list) & _memory_span_mask.*);
+            const class_span: ?*Span = @intToPtr(?*Span, @ptrToInt(free_list) & _memory_span_mask.*);
             if (span == class_span) {
                 // Adopt the heap class free list back into the span free list
                 var block: ?*anyopaque = span.free_list;
@@ -954,7 +952,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         // Global cache
 
         /// Finalize a global cache
-        fn _rpmalloc_global_cache_finalize(cache: *global_cache_t) void {
+        fn _rpmalloc_global_cache_finalize(cache: *GlobalCache) void {
             comptime assert(enable_global_cache);
 
             acquireLock(&cache.lock);
@@ -974,7 +972,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             }
         }
 
-        fn _rpmalloc_global_cache_insert_spans(span: [*]*span_t, span_count: usize, count: usize) void {
+        fn _rpmalloc_global_cache_insert_spans(span: [*]*Span, span_count: usize, count: usize) void {
             comptime assert(enable_global_cache);
 
             const cache_limit: usize = if (span_count == 1)
@@ -982,7 +980,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             else
                 global_cache_multiplier * (MAX_THREAD_SPAN_LARGE_CACHE - (span_count >> 1));
 
-            const cache: *global_cache_t = &_memory_span_cache[span_count - 1];
+            const cache: *GlobalCache = &_memory_span_cache[span_count - 1];
 
             var insert_count: usize = count;
             acquireLock(&cache.lock);
@@ -990,8 +988,8 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             if ((cache.count + insert_count) > cache_limit)
                 insert_count = cache_limit - cache.count;
 
-            // memcpy(cache->span + cache->count, span, sizeof(span_t*) * insert_count);
-            memcpy(cache.span[cache.count..].ptr, span, @sizeOf(*span_t) * insert_count);
+            // memcpy(cache->span + cache->count, span, sizeof(Span*) * insert_count);
+            memcpy(cache.span[cache.count..].ptr, span, @sizeOf(*Span) * insert_count);
             cache.count += @intCast(u32, insert_count);
 
             while ( // zig fmt: off
@@ -1003,17 +1001,17 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                     ((_memory_page_size > _memory_span_size.*) and (insert_count < count))
                 // zig fmt: on
             ) {
-                const current_span: *span_t = span[copyThenIncrement(&insert_count)];
+                const current_span: *Span = span[copyThenIncrement(&insert_count)];
                 current_span.next = cache.overflow;
                 cache.overflow = current_span;
             }
             releaseLock(&cache.lock);
 
-            var keep: ?*span_t = null;
+            var keep: ?*Span = null;
             {
                 var ispan: usize = insert_count;
                 while (ispan < count) : (ispan += 1) {
-                    const current_span: *span_t = span[ispan];
+                    const current_span: *Span = span[ispan];
                     // Keep master spans that has remaining subspans to avoid dangling them
                     if (current_span.flags.master and (atomic_load32(&current_span.remaining_spans) > current_span.span_count)) {
                         current_span.next = keep;
@@ -1031,7 +1029,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 var islot: usize = 0;
                 while (keep != null) {
                     while (islot < cache.count) : (islot += 1) {
-                        const current_span: *span_t = cache.span[islot];
+                        const current_span: *Span = cache.span[islot];
                         if (!current_span.flags.master or
                             (current_span.flags.master and (atomic_load32(&current_span.remaining_spans) <= current_span.span_count)))
                         {
@@ -1045,7 +1043,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 }
 
                 if (keep) |keep_unwrapped| {
-                    var tail: *span_t = keep_unwrapped;
+                    var tail: *Span = keep_unwrapped;
                     while (tail.next) |next| {
                         tail = next;
                     }
@@ -1055,10 +1053,10 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             }
         }
 
-        fn _rpmalloc_global_cache_extract_spans(span: [*]*span_t, span_count: usize, count: usize) usize {
+        fn _rpmalloc_global_cache_extract_spans(span: [*]*Span, span_count: usize, count: usize) usize {
             comptime assert(enable_global_cache);
 
-            const cache: *global_cache_t = &_memory_span_cache[span_count - 1];
+            const cache: *GlobalCache = &_memory_span_cache[span_count - 1];
 
             var extract_count: usize = 0;
             acquireLock(&cache.lock);
@@ -1068,7 +1066,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
 
             // memcpy(span + extract_count, cache->span + (cache->count - want), sizeof(span_t*) * want);
             std.mem.copy(
-                *span_t,
+                *Span,
                 // zig fmt: off
                 (span + extract_count)               [0..want],
                 cache.span[cache.count - want ..].ptr[0..want],
@@ -1079,7 +1077,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             extract_count += want;
 
             while (extract_count < count) {
-                const current_span: *span_t = cache.overflow orelse break;
+                const current_span: *Span = cache.overflow orelse break;
                 span[copyThenIncrement(&extract_count)] = current_span;
                 cache.overflow = current_span.next;
             }
@@ -1097,24 +1095,25 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         // Heap control
 
         /// Store the given spans as reserve in the given heap
-        fn _rpmalloc_heap_set_reserved_spans(heap: *heap_t, master: ?*span_t, reserve: ?*span_t, reserve_span_count: usize) void {
+        fn _rpmalloc_heap_set_reserved_spans(heap: *Heap, master: ?*Span, reserve: ?*Span, reserve_span_count: usize) void {
             heap.span_reserve_master = master;
             heap.span_reserve = reserve;
             heap.spans_reserved = @intCast(u32, reserve_span_count);
         }
 
         /// Adopt the deferred span cache list, optionally extracting the first single span for immediate re-use
-        fn _rpmalloc_heap_cache_adopt_deferred(heap: *heap_t, single_span: ?*?*span_t) void {
-            var maybe_span: ?*span_t = atomic_exchange_ptr_acquire(&heap.span_free_deferred, null);
+        fn _rpmalloc_heap_cache_adopt_deferred(heap: *Heap, single_span: ?*?*Span) void {
+            var maybe_span: ?*Span = atomic_exchange_ptr_acquire(&heap.span_free_deferred, null);
             while (maybe_span) |span| {
-                const next_span: ?*span_t = @ptrCast(?*span_t, @alignCast(@alignOf(span_t), span.free_list));
+                const next_span: ?*Span = @ptrCast(?*Span, @alignCast(@alignOf(Span), span.free_list));
                 rpmalloc_assert(span.heap == heap, "Span heap pointer corrupted");
 
-                if (EXPECTED(span.size_class < SIZE_CLASS_COUNT)) {
+                if (span.size_class < SIZE_CLASS_COUNT) {
+                    @setCold(false);
                     rpmalloc_assert(heap.full_span_count != 0, "Heap span counter corrupted");
                     heap.full_span_count -= 1;
                     if (single_span != null and single_span.?.* == null) {
-                        @ptrCast(*?*span_t, single_span).* = span;
+                        @ptrCast(*?*Span, single_span).* = span;
                     } else {
                         _rpmalloc_heap_cache_insert(heap, span);
                     }
@@ -1138,10 +1137,10 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             }
         }
 
-        fn _rpmalloc_heap_unmap(heap: *heap_t) void {
+        fn _rpmalloc_heap_unmap(heap: *Heap) void {
             if (heap.master_heap == null) {
                 if ((heap.finalize > 1) and atomic_load32(&heap.child_count) == 0) {
-                    const span: *span_t = @intToPtr(*span_t, @ptrToInt(heap) & _memory_span_mask.*);
+                    const span: *Span = @intToPtr(*Span, @ptrToInt(heap) & _memory_span_mask.*);
                     _rpmalloc_span_unmap(span);
                 }
             } else {
@@ -1151,7 +1150,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             }
         }
 
-        fn _rpmalloc_heap_global_finalize(heap: *heap_t) void {
+        fn _rpmalloc_heap_global_finalize(heap: *Heap) void {
             if (copyThenIncrement(&heap.finalize) > 1) {
                 heap.finalize -= 1;
                 return;
@@ -1162,10 +1161,10 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             if (enable_thread_cache) {
                 var iclass: usize = 0;
                 while (iclass < LARGE_CLASS_COUNT) : (iclass += 1) {
-                    const span_cache: *span_cache_t = if (iclass == 0)
+                    const span_cache: *SpanCache = if (iclass == 0)
                         &heap.span_cache
                     else
-                        @ptrCast(*span_cache_t, &heap.span_large_cache[iclass - 1]);
+                        @ptrCast(*SpanCache, &heap.span_large_cache[iclass - 1]);
 
                     var ispan: usize = 0;
                     while (ispan < span_cache.count) : (ispan += 1) {
@@ -1192,7 +1191,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
 
             //Heap is now completely free, unmap and remove from heap list
             const list_idx: usize = @intCast(usize, heap.id) % heap_array_size;
-            var list_heap: ?*heap_t = _memory_heaps[list_idx].?;
+            var list_heap: ?*Heap = _memory_heaps[list_idx].?;
             if (list_heap == heap) {
                 _memory_heaps[list_idx] = heap.next_heap;
             } else {
@@ -1206,7 +1205,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Insert a single span into thread heap cache, releasing to global cache if overflow
-        fn _rpmalloc_heap_cache_insert(heap: *heap_t, span: *span_t) void {
+        fn _rpmalloc_heap_cache_insert(heap: *Heap, span: *Span) void {
             if (UNEXPECTED(heap.finalize != 0)) {
                 _rpmalloc_span_unmap(span);
                 _rpmalloc_heap_global_finalize(heap);
@@ -1215,7 +1214,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             if (enable_thread_cache) {
                 const span_count: usize = span.span_count;
                 if (span_count == 1) {
-                    const span_cache: *span_cache_t = &heap.span_cache;
+                    const span_cache: *SpanCache = &heap.span_cache;
                     span_cache.span[copyThenIncrement(&span_cache.count)] = span;
 
                     if (span_cache.count == MAX_THREAD_SPAN_CACHE) {
@@ -1232,7 +1231,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                     }
                 } else {
                     const cache_idx: usize = span_count - 2;
-                    const span_cache: *span_large_cache_t = &heap.span_large_cache[cache_idx];
+                    const span_cache: *SpanLargeCache = &heap.span_large_cache[cache_idx];
                     span_cache.span[copyThenIncrement(&span_cache.count)] = span;
 
                     const cache_limit: usize = (MAX_THREAD_SPAN_LARGE_CACHE - (span_count >> 1));
@@ -1257,14 +1256,14 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Extract the given number of spans from the different cache levels
-        fn _rpmalloc_heap_thread_cache_extract(heap: *heap_t, span_count: usize) ?*span_t {
-            var span: ?*span_t = null;
+        fn _rpmalloc_heap_thread_cache_extract(heap: *Heap, span_count: usize) ?*Span {
+            var span: ?*Span = null;
             if (enable_thread_cache) {
-                var span_cache: *span_cache_t = undefined;
+                var span_cache: *SpanCache = undefined;
                 if (span_count == 1) {
                     span_cache = &heap.span_cache;
                 } else {
-                    span_cache = @ptrCast(*span_cache_t, &heap.span_large_cache[span_count - 2]);
+                    span_cache = @ptrCast(*SpanCache, &heap.span_large_cache[span_count - 2]);
                 }
 
                 if (span_cache.count != 0) {
@@ -1274,8 +1273,8 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             return span;
         }
 
-        fn _rpmalloc_heap_thread_cache_deferred_extract(heap: *heap_t, span_count: usize) ?*span_t {
-            var span: ?*span_t = null;
+        fn _rpmalloc_heap_thread_cache_deferred_extract(heap: *Heap, span_count: usize) ?*Span {
+            var span: ?*Span = null;
             if (span_count == 1) {
                 _rpmalloc_heap_cache_adopt_deferred(heap, &span);
             } else {
@@ -1285,7 +1284,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             return span;
         }
 
-        fn _rpmalloc_heap_reserved_extract(heap: *heap_t, span_count: usize) ?*span_t {
+        fn _rpmalloc_heap_reserved_extract(heap: *Heap, span_count: usize) ?*Span {
             if (heap.spans_reserved >= span_count) {
                 return _rpmalloc_span_map(heap, span_count);
             }
@@ -1293,16 +1292,16 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Extract a span from the global cache
-        fn _rpmalloc_heap_global_cache_extract(heap: *heap_t, span_count: usize) ?*span_t {
+        fn _rpmalloc_heap_global_cache_extract(heap: *Heap, span_count: usize) ?*Span {
             if (enable_global_cache) {
                 if (enable_thread_cache) {
-                    var span_cache: *span_cache_t = undefined;
+                    var span_cache: *SpanCache = undefined;
                     var wanted_count: usize = undefined;
                     if (span_count == 1) {
                         span_cache = &heap.span_cache;
                         wanted_count = THREAD_SPAN_CACHE_TRANSFER;
                     } else {
-                        span_cache = @ptrCast(*span_cache_t, &heap.span_large_cache[span_count - 2]);
+                        span_cache = @ptrCast(*SpanCache, &heap.span_large_cache[span_count - 2]);
                         wanted_count = THREAD_SPAN_LARGE_CACHE_TRANSFER;
                     }
                     span_cache.count = _rpmalloc_global_cache_extract_spans(span_cache.span[0..], span_count, wanted_count);
@@ -1310,8 +1309,8 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                         return span_cache.span[decrementAndCopy(&span_cache.count)];
                     }
                 } else {
-                    var span: ?*span_t = null;
-                    const count: usize = _rpmalloc_global_cache_extract_spans(@ptrCast(*[1]*span_t, &span), span_count, 1);
+                    var span: ?*Span = null;
+                    const count: usize = _rpmalloc_global_cache_extract_spans(@ptrCast(*[1]*Span, &span), span_count, 1);
                     if (count != 0) {
                         return span;
                     }
@@ -1321,12 +1320,12 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Get a span from one of the cache levels (thread cache, reserved, global cache) or fallback to mapping more memory
-        fn _rpmalloc_heap_extract_new_span(heap: *heap_t, maybe_heap_size_class: ?*heap_size_class_t, span_count_init: usize, class_idx: u32) ?*span_t {
+        fn _rpmalloc_heap_extract_new_span(heap: *Heap, maybe_heap_size_class: ?*HeapSizeClass, span_count_init: usize, class_idx: u32) ?*Span {
             var span_count = span_count_init;
             _ = class_idx;
             if (enable_thread_cache) cached_blk: {
-                const heap_size_class: *heap_size_class_t = maybe_heap_size_class orelse break :cached_blk;
-                const span: *span_t = heap_size_class.cache orelse break :cached_blk;
+                const heap_size_class: *HeapSizeClass = maybe_heap_size_class orelse break :cached_blk;
+                const span: *Span = heap_size_class.cache orelse break :cached_blk;
                 heap_size_class.cache = null;
                 if (heap.span_cache.count != 0) {
                     heap_size_class.cache = heap.span_cache.span[decrementAndCopy(&heap.span_cache.count)];
@@ -1354,11 +1353,11 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             return _rpmalloc_span_map(heap, base_span_count);
         }
 
-        fn _rpmalloc_heap_initialize(heap: *heap_t) void {
-            heap.* = comptime heap_t{
+        fn _rpmalloc_heap_initialize(heap: *Heap) void {
+            heap.* = comptime Heap{
                 .owner_thread = 0,
-                .size_class = [_]heap_size_class_t{.{ .free_list = null, .partial_span = null, .cache = null }} ** SIZE_CLASS_COUNT,
-                .span_cache = if (enable_thread_cache) span_cache_t{ .count = 0, .span = undefined } else .{},
+                .size_class = [_]HeapSizeClass{.{ .free_list = null, .partial_span = null, .cache = null }} ** SIZE_CLASS_COUNT,
+                .span_cache = if (enable_thread_cache) SpanCache{ .count = 0, .span = undefined } else .{},
                 .span_free_deferred = null,
                 .full_span_count = 0,
                 .span_reserve = null,
@@ -1370,7 +1369,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 .id = 0,
                 .finalize = 0,
                 .master_heap = null,
-                .span_large_cache = if (enable_thread_cache) [_]span_large_cache_t{.{ .count = 0, .span = undefined }} ** (LARGE_CLASS_COUNT - 1) else .{},
+                .span_large_cache = if (enable_thread_cache) [_]SpanLargeCache{.{ .count = 0, .span = undefined }} ** (LARGE_CLASS_COUNT - 1) else .{},
             };
             //Get a new heap ID
             heap.id = atomic_incr32(&_memory_heap_id);
@@ -1381,27 +1380,27 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             _memory_heaps[list_idx] = heap;
         }
 
-        fn _rpmalloc_heap_orphan(heap: *heap_t, first_class: bool) void {
+        fn _rpmalloc_heap_orphan(heap: *Heap, first_class: bool) void {
             _ = first_class;
             heap.owner_thread = std.math.maxInt(uptr_t);
-            const heap_list: *?*heap_t = &_memory_orphan_heaps;
+            const heap_list: *?*Heap = &_memory_orphan_heaps;
             heap.next_orphan = heap_list.*;
             heap_list.* = heap;
         }
 
         /// Allocate a new heap from newly mapped memory pages
-        fn _rpmalloc_heap_allocate_new() ?*heap_t {
+        fn _rpmalloc_heap_allocate_new() ?*Heap {
             // Map in pages for a 16 heaps. If page size is greater than required size for this, map a page and
             // use first part for heaps and remaining part for spans for allocations. Adds a lot of complexity,
             // but saves a lot of memory on systems where page size > 64 spans (4MiB)
-            const heap_size: usize = @sizeOf(heap_t);
+            const heap_size: usize = @sizeOf(Heap);
             const aligned_heap_size: usize = 16 * ((heap_size + 15) / 16);
             var request_heap_count: usize = 16;
-            var heap_span_count: usize = ((aligned_heap_size * request_heap_count) + @sizeOf(span_t) + _memory_span_size.* - 1) / _memory_span_size.*;
+            var heap_span_count: usize = ((aligned_heap_size * request_heap_count) + @sizeOf(Span) + _memory_span_size.* - 1) / _memory_span_size.*;
 
             var span_count: usize = heap_span_count;
-            const span: *span_t = span_init: {
-                var span: ?*span_t = null;
+            const span: *Span = span_init: {
+                var span: ?*Span = null;
 
                 var block_size: usize = _memory_span_size.* * heap_span_count;
                 // If there are global reserved spans, use these first
@@ -1413,17 +1412,17 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                         span_count = _memory_page_size / _memory_span_size.*;
                         block_size = _memory_page_size;
                         // If using huge pages, make sure to grab enough heaps to avoid reallocating a huge page just to serve new heaps
-                        const possible_heap_count: usize = (block_size - @sizeOf(span_t)) / aligned_heap_size;
+                        const possible_heap_count: usize = (block_size - @sizeOf(Span)) / aligned_heap_size;
                         if (possible_heap_count >= (request_heap_count * 16)) {
                             request_heap_count *= 16;
                         } else if (possible_heap_count < request_heap_count) {
                             request_heap_count = possible_heap_count;
                         }
-                        heap_span_count = ((aligned_heap_size * request_heap_count) + @sizeOf(span_t) + _memory_span_size.* - 1) / _memory_span_size.*;
+                        heap_span_count = ((aligned_heap_size * request_heap_count) + @sizeOf(Span) + _memory_span_size.* - 1) / _memory_span_size.*;
                     }
 
                     var align_offset: usize = 0;
-                    span = @ptrCast(*span_t, @alignCast(@alignOf(span_t), _rpmalloc_mmap(block_size, &align_offset) orelse return null));
+                    span = @ptrCast(*Span, @alignCast(@alignOf(Span), _rpmalloc_mmap(block_size, &align_offset) orelse return null));
 
                     // Master span will contain the heaps
                     _rpmalloc_span_initialize(span.?, span_count, heap_span_count, align_offset);
@@ -1432,8 +1431,8 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 break :span_init span.?;
             };
 
-            var remain_size: usize = _memory_span_size.* - @sizeOf(span_t);
-            const heap: *heap_t = @ptrCast(*heap_t, @alignCast(@alignOf(heap_t), pointer_offset(span, @sizeOf(span_t)).?));
+            var remain_size: usize = _memory_span_size.* - @sizeOf(Span);
+            const heap: *Heap = @ptrCast(*Heap, @alignCast(@alignOf(Heap), pointerOffset(span, @sizeOf(Span)).?));
             _rpmalloc_heap_initialize(heap);
 
             // Put extra heaps as orphans
@@ -1442,12 +1441,12 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 num_heaps = request_heap_count;
             }
             atomic_store32(&heap.child_count, @intCast(i32, num_heaps - 1));
-            var extra_heap: *heap_t = @ptrCast(*heap_t, @alignCast(@alignOf(heap_t), pointer_offset(heap, aligned_heap_size).?));
+            var extra_heap: *Heap = @ptrCast(*Heap, @alignCast(@alignOf(Heap), pointerOffset(heap, aligned_heap_size).?));
             while (num_heaps > 1) {
                 _rpmalloc_heap_initialize(extra_heap);
                 extra_heap.master_heap = heap;
                 _rpmalloc_heap_orphan(extra_heap, true);
-                extra_heap = @ptrCast(*heap_t, @alignCast(@alignOf(heap_t), pointer_offset(extra_heap, aligned_heap_size).?));
+                extra_heap = @ptrCast(*Heap, @alignCast(@alignOf(Heap), pointerOffset(extra_heap, aligned_heap_size).?));
                 num_heaps -= 1;
             }
 
@@ -1455,12 +1454,12 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 // Cap reserved spans
                 const remain_count: usize = span_count - heap_span_count;
                 var reserve_count: usize = if (remain_count > _memory_heap_reserve_count) _memory_heap_reserve_count else remain_count;
-                var remain_span: *span_t = @ptrCast(*span_t, @alignCast(@alignOf(span_t), pointer_offset(span, @intCast(isize, heap_span_count * _memory_span_size.*)).?));
+                var remain_span: *Span = @ptrCast(*Span, @alignCast(@alignOf(Span), pointerOffset(span, @intCast(isize, heap_span_count * _memory_span_size.*)).?));
                 _rpmalloc_heap_set_reserved_spans(heap, span, remain_span, reserve_count);
 
                 if (remain_count > reserve_count) {
                     // Set to global reserved spans
-                    remain_span = @ptrCast(*span_t, @alignCast(@alignOf(span_t), pointer_offset(remain_span, reserve_count * _memory_span_size.*).?));
+                    remain_span = @ptrCast(*Span, @alignCast(@alignOf(Span), pointerOffset(remain_span, reserve_count * _memory_span_size.*).?));
                     reserve_count = remain_count - reserve_count;
                     _rpmalloc_global_set_reserved_spans(span, remain_span, reserve_count);
                 }
@@ -1469,17 +1468,17 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             return heap;
         }
 
-        fn _rpmalloc_heap_extract_orphan(heap_list: *?*heap_t) ?*heap_t {
-            const heap: ?*heap_t = heap_list.*;
+        fn _rpmalloc_heap_extract_orphan(heap_list: *?*Heap) ?*Heap {
+            const heap: ?*Heap = heap_list.*;
             heap_list.* = if (heap) |heap_unwrapped| heap_unwrapped.next_orphan else null;
             return heap;
         }
 
         /// Allocate a new heap, potentially reusing a previously orphaned heap
-        fn _rpmalloc_heap_allocate() ?*heap_t {
+        fn _rpmalloc_heap_allocate() ?*Heap {
             acquireLock(&_memory_global_lock);
             defer releaseLock(&_memory_global_lock);
-            const heap: *heap_t =
+            const heap: *Heap =
                 _rpmalloc_heap_extract_orphan(&_memory_orphan_heaps) orelse
                 _rpmalloc_heap_allocate_new() orelse
                 return null;
@@ -1488,7 +1487,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         fn _rpmalloc_heap_release(heapptr: ?*anyopaque, first_class: bool, release_cache: bool) void {
-            const heap: *heap_t = @ptrCast(*heap_t, @alignCast(@alignOf(heap_t), heapptr orelse return));
+            const heap: *Heap = @ptrCast(*Heap, @alignCast(@alignOf(Heap), heapptr orelse return));
 
             // Release thread cache spans back to global cache
             _rpmalloc_heap_cache_adopt_deferred(heap, null);
@@ -1496,7 +1495,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 if (release_cache or heap.finalize != 0) {
                     var iclass: usize = 0;
                     while (iclass < LARGE_CLASS_COUNT) : (iclass += 1) {
-                        const span_cache: *span_cache_t = if (iclass == 0) &heap.span_cache else @ptrCast(*span_cache_t, &heap.span_large_cache[iclass - 1]);
+                        const span_cache: *SpanCache = if (iclass == 0) &heap.span_cache else @ptrCast(*SpanCache, &heap.span_large_cache[iclass - 1]);
 
                         if (span_cache.count == 0) continue;
                         if (enable_global_cache) {
@@ -1542,9 +1541,9 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             _rpmalloc_heap_release_raw(heapptr, true);
         }
 
-        fn _rpmalloc_heap_finalize(heap: *heap_t) void {
+        fn _rpmalloc_heap_finalize(heap: *Heap) void {
             if (heap.spans_reserved != 0) {
-                const span: *span_t = _rpmalloc_span_map_from_reserve(heap, heap.spans_reserved).?;
+                const span: *Span = _rpmalloc_span_map_from_reserve(heap, heap.spans_reserved).?;
                 _rpmalloc_span_unmap(span);
                 assert(heap.spans_reserved == 0);
             }
@@ -1558,16 +1557,16 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                         _rpmalloc_span_unmap(cache);
                     }
                     heap.size_class[iclass].cache = null;
-                    var maybe_span: ?*span_t = heap.size_class[iclass].partial_span;
+                    var maybe_span: ?*Span = heap.size_class[iclass].partial_span;
                     while (maybe_span) |span| {
-                        const next: ?*span_t = span.next;
+                        const next: ?*Span = span.next;
                         _ = _rpmalloc_span_finalize(heap, iclass, span, &heap.size_class[iclass].partial_span);
                         maybe_span = next;
                     }
                     // If class still has a free list it must be a full span
                     if (heap.size_class[iclass].free_list) |free_list| {
-                        const class_span: *span_t = @intToPtr(*span_t, @ptrToInt(free_list) & _memory_span_mask.*);
-                        const list: ?*?*span_t = null;
+                        const class_span: *Span = @intToPtr(*Span, @ptrToInt(free_list) & _memory_span_mask.*);
+                        const list: ?*?*Span = null;
 
                         heap.full_span_count -= 1;
                         if (!_rpmalloc_span_finalize(heap, iclass, class_span, list)) {
@@ -1583,7 +1582,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             if (enable_thread_cache) {
                 var iclass: usize = 0;
                 while (iclass < LARGE_CLASS_COUNT) : (iclass += 1) {
-                    const span_cache: *span_cache_t = if (iclass == 0) &heap.span_cache else @ptrCast(*span_cache_t, &heap.span_large_cache[iclass - 1]);
+                    const span_cache: *SpanCache = if (iclass == 0) &heap.span_cache else @ptrCast(*SpanCache, &heap.span_large_cache[iclass - 1]);
                     var ispan: usize = 0;
                     while (ispan < span_cache.count) : (ispan += 1) {
                         _rpmalloc_span_unmap(span_cache.span[ispan]);
@@ -1604,7 +1603,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Allocate a small/medium sized memory block from the given heap
-        fn _rpmalloc_allocate_from_heap_fallback(heap: *heap_t, heap_size_class: *heap_size_class_t, class_idx: u32) ?*anyopaque {
+        fn _rpmalloc_allocate_from_heap_fallback(heap: *Heap, heap_size_class: *HeapSizeClass, class_idx: u32) ?*anyopaque {
             if (heap_size_class.partial_span) |span| {
                 @setCold(false);
                 rpmalloc_assert(span.block_count == _memory_size_class[span.size_class].block_count, "Span block count corrupted");
@@ -1618,7 +1617,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                         span.free_list = null;
                     } else {
                         //If the span did not fully initialize free list, link up another page worth of blocks
-                        const block_start: *anyopaque = pointer_offset(span, SPAN_HEADER_SIZE + (@as(usize, span.free_list_limit) * span.block_size)).?;
+                        const block_start: *anyopaque = pointerOffset(span, SPAN_HEADER_SIZE + (@as(usize, span.free_list_limit) * span.block_size)).?;
                         span.free_list_limit += free_list_partial_init(&heap_size_class.free_list, &block, @intToPtr(*anyopaque, @ptrToInt(block_start) & ~(_memory_page_size - 1)), block_start, span.block_count - span.free_list_limit, span.block_size);
                     }
                     break :block block.?;
@@ -1644,7 +1643,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                     return block;
                 }
                 // The span is fully utilized, unlink from partial list and add to fully utilized list
-                _rpmalloc_span_double_link_list_pop_head(@ptrCast(**span_t, &heap_size_class.partial_span), span);
+                _rpmalloc_span_double_link_list_pop_head(@ptrCast(**Span, &heap_size_class.partial_span), span);
                 heap.full_span_count += 1;
                 return block;
             }
@@ -1659,30 +1658,32 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Allocate a small sized memory block from the given heap
-        fn _rpmalloc_allocate_small(heap: *heap_t, size: usize) ?*anyopaque {
+        fn _rpmalloc_allocate_small(heap: *Heap, size: usize) ?*anyopaque {
             // Small sizes have unique size classes
             const class_idx: u32 = @intCast(u32, (size + (SMALL_GRANULARITY - 1)) >> SMALL_GRANULARITY_SHIFT);
-            const heap_size_class: *heap_size_class_t = &heap.size_class[class_idx];
-            if (EXPECTED(heap_size_class.free_list != null)) {
+            const heap_size_class: *HeapSizeClass = &heap.size_class[class_idx];
+            if (heap_size_class.free_list != null) {
+                @setCold(false);
                 return free_list_pop(&heap_size_class.free_list);
             }
             return _rpmalloc_allocate_from_heap_fallback(heap, heap_size_class, class_idx);
         }
 
         /// Allocate a medium sized memory block from the given heap
-        fn _rpmalloc_allocate_medium(heap: *heap_t, size: usize) ?*anyopaque {
+        fn _rpmalloc_allocate_medium(heap: *Heap, size: usize) ?*anyopaque {
             // Calculate the size class index and do a dependent lookup of the final class index (in case of merged classes)
             const base_idx: u32 = @intCast(u32, SMALL_CLASS_COUNT + ((size - (SMALL_SIZE_LIMIT + 1)) >> MEDIUM_GRANULARITY_SHIFT));
             const class_idx: u32 = _memory_size_class[base_idx].class_idx;
-            const heap_size_class: *heap_size_class_t = &heap.size_class[class_idx];
-            if (EXPECTED(heap_size_class.free_list != null)) {
+            const heap_size_class: *HeapSizeClass = &heap.size_class[class_idx];
+            if (heap_size_class.free_list != null) {
+                @setCold(false);
                 return free_list_pop(&heap_size_class.free_list);
             }
             return _rpmalloc_allocate_from_heap_fallback(heap, heap_size_class, class_idx);
         }
 
         /// Allocate a large sized memory block from the given heap
-        fn _rpmalloc_allocate_large(heap: *heap_t, size_init: usize) ?*anyopaque {
+        fn _rpmalloc_allocate_large(heap: *Heap, size_init: usize) ?*anyopaque {
             var size = size_init;
 
             // Calculate number of needed max sized spans (including header)
@@ -1695,7 +1696,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             }
 
             // Find a span in one of the cache levels
-            const span: *span_t = _rpmalloc_heap_extract_new_span(heap, null, span_count, SIZE_CLASS_LARGE) orelse return null;
+            const span: *Span = _rpmalloc_heap_extract_new_span(heap, null, span_count, SIZE_CLASS_LARGE) orelse return null;
 
             // Mark span as owned by this heap and set base data
             rpmalloc_assert(span.span_count >= span_count, "Internal failure");
@@ -1703,11 +1704,11 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             span.heap = heap;
             heap.full_span_count += 1;
 
-            return pointer_offset(span, SPAN_HEADER_SIZE);
+            return pointerOffset(span, SPAN_HEADER_SIZE);
         }
 
         /// Allocate a huge block by mapping memory pages directly
-        fn _rpmalloc_allocate_huge(heap: *heap_t, size_init: usize) ?*anyopaque {
+        fn _rpmalloc_allocate_huge(heap: *Heap, size_init: usize) ?*anyopaque {
             var size = size_init;
 
             _rpmalloc_heap_cache_adopt_deferred(heap, null);
@@ -1717,7 +1718,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 num_pages += 1;
             }
             var align_offset: usize = 0;
-            const span: *span_t = @ptrCast(*span_t, @alignCast(@alignOf(span_t), _rpmalloc_mmap(num_pages * _memory_page_size, &align_offset) orelse return null));
+            const span: *Span = @ptrCast(*Span, @alignCast(@alignOf(Span), _rpmalloc_mmap(num_pages * _memory_page_size, &align_offset) orelse return null));
 
             // Store page count in span_count
             span.size_class = SIZE_CLASS_HUGE;
@@ -1726,18 +1727,18 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             span.heap = heap;
             heap.full_span_count += 1;
 
-            return pointer_offset(span, SPAN_HEADER_SIZE);
+            return pointerOffset(span, SPAN_HEADER_SIZE);
         }
 
         /// Allocate a block of the given size
-        fn _rpmalloc_allocate(heap: *heap_t, size: usize) ?*anyopaque {
+        fn _rpmalloc_allocate(heap: *Heap, size: usize) ?*anyopaque {
             if (EXPECTED(size <= SMALL_SIZE_LIMIT)) return _rpmalloc_allocate_small(heap, size);
             if (size <= _memory_medium_size_limit) return _rpmalloc_allocate_medium(heap, size);
             if (size <= LARGE_SIZE_LIMIT(_memory_span_size.*)) return _rpmalloc_allocate_large(heap, size);
             return _rpmalloc_allocate_huge(heap, size);
         }
 
-        fn _rpmalloc_aligned_allocate(heap: *heap_t, alignment: usize, size: usize) ?*anyopaque {
+        fn _rpmalloc_aligned_allocate(heap: *Heap, alignment: usize, size: usize) ?*anyopaque {
             if (alignment <= SMALL_GRANULARITY) {
                 return _rpmalloc_allocate(heap, size);
             }
@@ -1766,7 +1767,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 if (@ptrToInt(ptr) & align_mask != 0) {
                     ptr = @intToPtr(*anyopaque, (@ptrToInt(ptr) & ~@as(uptr_t, align_mask)) + alignment);
                     //Mark as having aligned blocks
-                    const span: *span_t = @intToPtr(*span_t, @ptrToInt(ptr) & _memory_span_mask.*);
+                    const span: *Span = @intToPtr(*Span, @ptrToInt(ptr) & _memory_span_mask.*);
                     span.flags.aligned_blocks = true;
                 }
                 return ptr;
@@ -1811,21 +1812,21 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             var ptr: ?*anyopaque = null;
             var mapped_size: usize = undefined;
             var align_offset: usize = undefined;
-            var span: *span_t = undefined;
+            var span: *Span = undefined;
 
             retry: while (true) {
                 align_offset = 0;
                 mapped_size = num_pages * _memory_page_size;
 
-                span = @ptrCast(*span_t, @alignCast(@alignOf(span_t), _rpmalloc_mmap(mapped_size, &align_offset) orelse return null));
-                ptr = pointer_offset(span, SPAN_HEADER_SIZE);
+                span = @ptrCast(*Span, @alignCast(@alignOf(Span), _rpmalloc_mmap(mapped_size, &align_offset) orelse return null));
+                ptr = pointerOffset(span, SPAN_HEADER_SIZE);
 
                 if (@ptrToInt(ptr) & align_mask != 0) {
                     ptr = @intToPtr(*anyopaque, (@ptrToInt(ptr) & ~@as(uptr_t, align_mask)) + alignment);
                 }
 
-                if ((@intCast(usize, pointer_diff(ptr, span)) >= _memory_span_size.*) or
-                    (@ptrToInt(pointer_offset(ptr, size)) > @ptrToInt(pointer_offset(span, mapped_size))) or
+                if ((@intCast(usize, pointerDiff(ptr, span)) >= _memory_span_size.*) or
+                    (@ptrToInt(pointerOffset(ptr, size)) > @ptrToInt(pointerOffset(span, mapped_size))) or
                     ((@ptrToInt(ptr) & _memory_span_mask.*) != @ptrToInt(span)))
                 {
                     _rpmalloc_unmap(span, mapped_size, align_offset, mapped_size);
@@ -1853,8 +1854,8 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         // Deallocation entry points
 
         /// Deallocate the given small/medium memory block in the current thread local heap
-        fn _rpmalloc_deallocate_direct_small_or_medium(span: *span_t, block: *anyopaque) void {
-            const heap: *heap_t = span.heap.?;
+        fn _rpmalloc_deallocate_direct_small_or_medium(span: *Span, block: *anyopaque) void {
+            const heap: *Heap = span.heap.?;
             rpmalloc_assert(heap.owner_thread == get_thread_id() or heap.owner_thread == 0 or heap.finalize != 0, "Internal failure");
             //Add block to free list
             if (UNEXPECTED(_rpmalloc_span_is_fully_utilized(span))) {
@@ -1892,16 +1893,16 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             }
         }
 
-        fn _rpmalloc_deallocate_defer_free_span(heap: *heap_t, span: *span_t) void {
+        fn _rpmalloc_deallocate_defer_free_span(heap: *Heap, span: *Span) void {
             //This list does not need ABA protection, no mutable side state
             while (true) {
                 span.free_list = @ptrCast(?*anyopaque, atomic_load_ptr(&heap.span_free_deferred));
-                if (atomic_cas_ptr(&heap.span_free_deferred, span, @ptrCast(?*span_t, @alignCast(@alignOf(span_t), span.free_list)))) break;
+                if (atomic_cas_ptr(&heap.span_free_deferred, span, @ptrCast(?*Span, @alignCast(@alignOf(Span), span.free_list)))) break;
             }
         }
 
         /// Put the block in the deferred free list of the owning span
-        fn _rpmalloc_deallocate_defer_small_or_medium(span: *span_t, block: *anyopaque) void {
+        fn _rpmalloc_deallocate_defer_small_or_medium(span: *Span, block: *anyopaque) void {
             // The memory ordering here is a bit tricky, to avoid having to ABA protect
             // the deferred free list to avoid desynchronization of list and list size
             // we need to have acquire semantics on successful CAS of the pointer to
@@ -1923,13 +1924,13 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             }
         }
 
-        fn _rpmalloc_deallocate_small_or_medium(span: *span_t, p_init: *anyopaque) void {
+        fn _rpmalloc_deallocate_small_or_medium(span: *Span, p_init: *anyopaque) void {
             var p = p_init;
             if (span.flags.aligned_blocks) {
                 //Realign pointer to block start
-                const blocks_start: *anyopaque = pointer_offset(span, SPAN_HEADER_SIZE).?;
-                const block_offset: u32 = @intCast(u32, pointer_diff(p, blocks_start));
-                p = pointer_offset(p, -@intCast(i32, block_offset % span.block_size)).?;
+                const blocks_start: *anyopaque = pointerOffset(span, SPAN_HEADER_SIZE).?;
+                const block_offset: u32 = @intCast(u32, pointerDiff(p, blocks_start));
+                p = pointerOffset(p, -@intCast(i32, block_offset % span.block_size)).?;
             }
 
             //Check if block belongs to this heap or if deallocation should be deferred
@@ -1942,7 +1943,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Deallocate the given large memory block to the current heap
-        fn _rpmalloc_deallocate_large(span: *span_t) void {
+        fn _rpmalloc_deallocate_large(span: *Span) void {
             rpmalloc_assert(span.size_class == SIZE_CLASS_LARGE, "Bad span size class");
             rpmalloc_assert(!span.flags.master or !span.flags.subspan, "Span flag corrupted");
             rpmalloc_assert(span.flags.master or span.flags.subspan, "Span flag corrupted");
@@ -1956,7 +1957,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             rpmalloc_assert(span.heap.?.full_span_count != 0, "Heap span counter corrupted");
             span.heap.?.full_span_count -= 1;
 
-            const heap: *heap_t = span.heap.?;
+            const heap: *Heap = span.heap.?;
 
             const set_as_reserved = if (enable_thread_cache)
                 ((span.span_count > 1) and (heap.span_cache.count == 0) and heap.finalize == 0 and heap.spans_reserved == 0)
@@ -1968,7 +1969,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 if (span.flags.master) {
                     heap.span_reserve_master = span;
                 } else { //SPAN_FLAG_SUBSPAN
-                    const master: *span_t = @ptrCast(*span_t, @alignCast(@alignOf(span_t), pointer_offset(span, -@intCast(iptr_t, @as(usize, span.offset_from_master) * _memory_span_size.*)).?));
+                    const master: *Span = @ptrCast(*Span, @alignCast(@alignOf(Span), pointerOffset(span, -@intCast(iptr_t, @as(usize, span.offset_from_master) * _memory_span_size.*)).?));
                     heap.span_reserve_master = master;
                     rpmalloc_assert(master.flags.master, "Span flag corrupted");
                     rpmalloc_assert(atomic_load32(&master.remaining_spans) >= span.span_count, "Master span count corrupted");
@@ -1980,7 +1981,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Deallocate the given huge span
-        fn _rpmalloc_deallocate_huge(span: *span_t) void {
+        fn _rpmalloc_deallocate_huge(span: *Span) void {
             const defer_dealloc: bool = (span.heap.?.owner_thread != get_thread_id()) and span.heap.?.finalize == 0;
             if (defer_dealloc) {
                 _rpmalloc_deallocate_defer_free_span(span.heap.?, span);
@@ -1997,8 +1998,12 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         /// Deallocate the given block
         fn _rpmalloc_deallocate(p: *anyopaque) void {
             //Grab the span (always at start of span, using span alignment)
-            const span: *span_t = EXPECTED(@intToPtr(?*span_t, @ptrToInt(p) & _memory_span_mask.*)) orelse return;
-            if (EXPECTED(span.size_class < SIZE_CLASS_COUNT)) {
+            const span: *Span = if (@intToPtr(?*Span, @ptrToInt(p) & _memory_span_mask.*)) |span| span: {
+                @setCold(false);
+                break :span span;
+            } else return;
+            if (span.size_class < SIZE_CLASS_COUNT) {
+                @setCold(false);
                 _rpmalloc_deallocate_small_or_medium(span, p);
             } else if (span.size_class == SIZE_CLASS_LARGE) {
                 _rpmalloc_deallocate_large(span);
@@ -2017,22 +2022,23 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         const RPMALLOC_GROW_OR_FAIL = 2;
 
         /// Reallocate the given block to the given size
-        fn _rpmalloc_reallocate(heap: *heap_t, p: *anyopaque, size: usize, oldsize_init: usize, flags: c_uint) ?*anyopaque {
+        fn _rpmalloc_reallocate(heap: *Heap, p: *anyopaque, size: usize, oldsize_init: usize, flags: c_uint) ?*anyopaque {
             _ = heap;
             _ = flags;
 
             var oldsize = oldsize_init;
             //Grab the span using guaranteed span alignment
-            const span: *span_t = @intToPtr(*span_t, @ptrToInt(p) & _memory_span_mask.*);
-            if (EXPECTED(span.size_class < SIZE_CLASS_COUNT)) {
+            const span: *Span = @intToPtr(*Span, @ptrToInt(p) & _memory_span_mask.*);
+            if (span.size_class < SIZE_CLASS_COUNT) {
+                @setCold(false);
                 // Small/medium sized block
                 rpmalloc_assert(span.span_count == 1, "Span counter corrupted");
-                const blocks_start: *anyopaque = pointer_offset(span, SPAN_HEADER_SIZE).?;
-                const block_offset: u32 = @intCast(u32, pointer_diff(p, blocks_start));
+                const blocks_start: *anyopaque = pointerOffset(span, SPAN_HEADER_SIZE).?;
+                const block_offset: u32 = @intCast(u32, pointerDiff(p, blocks_start));
                 const block_idx: u32 = block_offset / span.block_size;
-                const block: *anyopaque = pointer_offset(blocks_start, @intCast(usize, block_idx) * span.block_size).?;
+                const block: *anyopaque = pointerOffset(blocks_start, @intCast(usize, block_idx) * span.block_size).?;
                 if (oldsize == 0) {
-                    oldsize = @intCast(usize, @intCast(isize, span.block_size) - pointer_diff(p, block));
+                    oldsize = @intCast(usize, @intCast(isize, span.block_size) - pointerDiff(p, block));
                 }
                 if (@intCast(usize, span.block_size) >= size) {
                     //Still fits in block, never mind trying to save memory, but preserve data if alignment changed
@@ -2047,9 +2053,9 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                     num_spans += 1;
                 }
                 const current_spans: usize = span.span_count;
-                const block: *anyopaque = pointer_offset(span, SPAN_HEADER_SIZE).?;
+                const block: *anyopaque = pointerOffset(span, SPAN_HEADER_SIZE).?;
                 if (oldsize == 0) {
-                    oldsize = (current_spans * _memory_span_size.*) - @intCast(usize, pointer_diff(p, block)) - SPAN_HEADER_SIZE;
+                    oldsize = (current_spans * _memory_span_size.*) - @intCast(usize, pointerDiff(p, block)) - SPAN_HEADER_SIZE;
                 }
                 if ((current_spans >= num_spans) and (total_size >= (oldsize / 2))) {
                     //Still fits in block, never mind trying to save memory, but preserve data if alignment changed
@@ -2065,9 +2071,9 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 }
                 // Page count is stored in span_count
                 const current_pages: usize = span.span_count;
-                const block: *anyopaque = pointer_offset(span, SPAN_HEADER_SIZE).?;
+                const block: *anyopaque = pointerOffset(span, SPAN_HEADER_SIZE).?;
                 if (oldsize == 0) {
-                    oldsize = (current_pages * _memory_page_size) - @intCast(usize, pointer_diff(p, block)) - SPAN_HEADER_SIZE;
+                    oldsize = (current_pages * _memory_page_size) - @intCast(usize, pointerDiff(p, block)) - SPAN_HEADER_SIZE;
                 }
                 if ((current_pages >= num_pages) and (num_pages >= (current_pages / 2))) {
                     //Still fits in block, never mind trying to save memory, but preserve data if alignment changed
@@ -2080,7 +2086,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             return null;
         }
 
-        fn _rpmalloc_aligned_reallocate(heap: *heap_t, ptr: *anyopaque, alignment: usize, size: usize, oldsize: usize, flags: c_uint) ?*anyopaque {
+        fn _rpmalloc_aligned_reallocate(heap: *Heap, ptr: *anyopaque, alignment: usize, size: usize, oldsize: usize, flags: c_uint) ?*anyopaque {
             if (alignment <= SMALL_GRANULARITY) {
                 return _rpmalloc_reallocate(heap, ptr, size, oldsize, flags);
             }
@@ -2098,20 +2104,20 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         /// Get the usable size of the given block
         fn _rpmalloc_usable_size(p: *anyopaque) usize {
             // Grab the span using guaranteed span alignment
-            const span: *span_t = @intToPtr(*span_t, @ptrToInt(p) & _memory_span_mask.*);
+            const span: *Span = @intToPtr(*Span, @ptrToInt(p) & _memory_span_mask.*);
             if (span.size_class < SIZE_CLASS_COUNT) {
                 // Small/medium block
-                const blocks_start: *anyopaque = pointer_offset(span, SPAN_HEADER_SIZE).?;
-                return span.block_size - @intCast(usize, pointer_diff(p, blocks_start)) % span.block_size;
+                const blocks_start: *anyopaque = pointerOffset(span, SPAN_HEADER_SIZE).?;
+                return span.block_size - @intCast(usize, pointerDiff(p, blocks_start)) % span.block_size;
             }
             if (span.size_class == SIZE_CLASS_LARGE) {
                 // Large block
                 const current_spans: usize = span.span_count;
-                return (current_spans * _memory_span_size.*) - @intCast(usize, pointer_diff(p, span));
+                return (current_spans * _memory_span_size.*) - @intCast(usize, pointerDiff(p, span));
             }
             // Oversized block, page count is stored in span_count
             const current_pages: usize = span.span_count;
-            return (current_pages * _memory_page_size) - @intCast(usize, pointer_diff(p, span));
+            return (current_pages * _memory_page_size) - @intCast(usize, pointerDiff(p, span));
         }
 
         /// Adjust and optimize the size class properties for the given class
@@ -2165,8 +2171,8 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         inline fn rpmalloc(size: usize) ?*anyopaque {
-            if (size >= MAX_ALLOC_SIZE()) return null;
-            const heap: *heap_t = get_thread_heap();
+            if (size >= maxAllocSize()) return null;
+            const heap: *Heap = get_thread_heap();
             return _rpmalloc_allocate(heap, size);
         }
 
@@ -2175,8 +2181,8 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         inline fn rprealloc(ptr: *anyopaque, size: usize) ?*anyopaque {
-            if (size >= MAX_ALLOC_SIZE()) return ptr;
-            const heap: *heap_t = get_thread_heap();
+            if (size >= maxAllocSize()) return ptr;
+            const heap: *Heap = get_thread_heap();
             return _rpmalloc_reallocate(heap, ptr, size, 0, 0);
         }
 
@@ -2184,12 +2190,12 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             if ((size +% alignment < size) or (alignment > _memory_page_size)) {
                 return null;
             }
-            const heap: *heap_t = get_thread_heap();
+            const heap: *Heap = get_thread_heap();
             return _rpmalloc_aligned_reallocate(heap, ptr, alignment, size, oldsize, flags);
         }
 
         inline fn rpaligned_alloc(alignment: usize, size: usize) ?*anyopaque {
-            const heap: *heap_t = get_thread_heap();
+            const heap: *Heap = get_thread_heap();
             return _rpmalloc_aligned_allocate(heap, alignment, size);
         }
         pub const Config = struct {
