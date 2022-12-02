@@ -1072,10 +1072,8 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         fn heapGlobalFinalize(heap: *Heap) void {
-            if (copyThenIncrement(&heap.finalize) > 1) {
-                heap.finalize -= 1;
-                return;
-            }
+            if (heap.finalize > 1) return;
+            heap.finalize += 1;
 
             heapFinalize(heap);
 
@@ -1837,7 +1835,10 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 if (free_list != INVALID_POINTER) break;
             }
             ptrAndAlignCast(*?*anyopaque, block).* = free_list;
-            const free_count: u32 = incrementAndCopy(&span.list_size);
+
+            span.list_size += 1;
+            const free_count: u32 = span.list_size;
+
             const all_deferred_free = free_count == span.block_count;
             atomicStorePtrRelease(&span.free_list_deferred, block);
             if (all_deferred_free) {
@@ -2055,17 +2056,6 @@ comptime {
 /// `same as --x` in C.
 inline fn decrementAndCopy(x: anytype) @TypeOf(x.*) {
     x.* -= 1;
-    return x.*;
-}
-/// same as `x--` in C.
-inline fn copyThenDecrement(x: anytype) @TypeOf(x.*) {
-    const result = x.*;
-    x.* -= 1;
-    return result;
-}
-/// same as `++x` in C.
-inline fn incrementAndCopy(x: anytype) @TypeOf(x.*) {
-    x.* += 1;
     return x.*;
 }
 /// same as `x++` in C.
