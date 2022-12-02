@@ -1,21 +1,29 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
 test {
-    const Rp = RPMemoryAllocator(.{
-        .backing_allocator = .{ .specific = &std.testing.allocator },
-        .configurable = true,
+    try testAllocator(.{
+        .backing_allocator = &std.testing.allocator,
+        .configurable_sizes = true,
         .enable_thread_cache = true,
         .enable_global_cache = true,
         .enable_unlimited_cache = true,
-    });
-    try Rp.init(.{});
+    }, .{ .backing_allocator = null });
+}
+
+fn testAllocator(
+    comptime options: RPMallocOptions,
+    init_cfg: RPMalloc(options).InitConfig,
+) !void {
+    const Rp = RPMalloc(options);
+    try Rp.init(init_cfg);
     defer Rp.deinit();
     const allocator = Rp.allocator();
 
     comptime var alignment: std.math.Log2Int(u29) = 1;
-    inline while ((1 << alignment) <= std.mem.page_size) : (alignment += 1) {
+    inline while ((1 << alignment) <= std.mem.page_size) : (alignment *= 2) {
         var size: usize = 0;
         while (size < std.mem.page_size) : (size += 1) {
             var mem = try allocator.alignedAlloc(u8, 1 << alignment, size);
@@ -28,10 +36,10 @@ test {
     }
 }
 
-pub const RPMemoryAllocatorConfig = struct {
-    /// Define RPMALLOC_CONFIGURABLE to enable configuring sizes. Will introduce
-    /// a very small overhead due to some size calculations not being compile time constants
-    configurable: bool = false,
+pub const RPMallocOptions = struct {
+    /// Enable configuring sizes at runtime. Will introduce a very small
+    /// overhead due to some size calculations not being compile time constants
+    configurable_sizes: bool = false,
     /// Size of heap hashmap
     heap_array_size: usize = 47,
     /// Enable per-thread cache
@@ -48,48 +56,45 @@ pub const RPMemoryAllocatorConfig = struct {
     default_span_map_count: usize = 64,
     /// Multiplier for global cache
     global_cache_multiplier: usize = 8,
-    /// Either a pointer to a comptime-known pointer to an allocator interface, or tag to indicate
+    /// Either a pointer to a comptime-known pointer to an allocator interface, or null to indicate
     /// that the backing allocator will be supplied during initialisation.
-    backing_allocator: BackingAllocator = .{ .specific = &std.heap.page_allocator },
-
-    pub const BackingAllocator = union(enum) {
-        specific: *const std.mem.Allocator,
-        runtime,
-    };
+    backing_allocator: ?*const Allocator = &std.heap.page_allocator,
 };
-pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
-    const configurable_sizes = cfg.configurable;
+pub fn RPMalloc(comptime options: RPMallocOptions) type {
+    const configurable_sizes = options.configurable_sizes;
 
-    const heap_array_size = cfg.heap_array_size;
-    const enable_thread_cache = cfg.enable_thread_cache;
-    const enable_global_cache = cfg.enable_global_cache;
-    const disable_unmap = cfg.disable_unmap;
-    const enable_unlimited_cache = cfg.enable_unlimited_cache;
-    const default_span_map_count = cfg.default_span_map_count;
-    const global_cache_multiplier = cfg.global_cache_multiplier;
+    const heap_array_size = options.heap_array_size;
+    const enable_thread_cache = options.enable_thread_cache;
+    const enable_global_cache = options.enable_global_cache;
+    const disable_unmap = options.disable_unmap;
+    const enable_unlimited_cache = options.enable_unlimited_cache;
+    const default_span_map_count = options.default_span_map_count;
+    const global_cache_multiplier = options.global_cache_multiplier;
 
     if (disable_unmap and !enable_global_cache) {
         @compileError("Must use global cache if unmap is disabled");
     }
 
     if (disable_unmap and !enable_unlimited_cache) {
-        var new_cfg: RPMemoryAllocatorConfig = cfg;
-        new_cfg.enable_unlimited_cache = true;
-        return RPMemoryAllocator(new_cfg);
+        var new_options: RPMallocOptions = options;
+        new_options.enable_unlimited_cache = true;
+        return RPMalloc(new_options);
     }
 
     if (!enable_global_cache and enable_unlimited_cache) {
-        var new_cfg = cfg;
-        new_cfg.enable_unlimited_cache = false;
-        return RPMemoryAllocator(new_cfg);
+        var new_options = options;
+        new_options.enable_unlimited_cache = false;
+        return RPMalloc(new_options);
     }
 
+    const known_allocator = options.backing_allocator != null;
     const is_windows_and_not_dynamic = builtin.os.tag == .windows and builtin.link_mode != .Dynamic;
+
     return struct {
-        pub fn allocator() std.mem.Allocator {
-            return std.mem.Allocator{
+        pub fn allocator() Allocator {
+            return Allocator{
                 .ptr = undefined,
-                .vtable = &std.mem.Allocator.VTable{
+                .vtable = &Allocator.VTable{
                     .alloc = alloc,
                     .resize = resize,
                     .free = free,
@@ -98,20 +103,20 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Initialize the allocator and setup global data.
-        pub fn init(config: Config) error{}!void {
-            if (initialized) {
-                threadInitialize();
-                return;
-            }
+        pub fn init(config: InitConfig) error{}!void {
+            // TODO: Should we instead just expose `threadInitialize` as a separate function?
+            if (initialized and getThreadId() != main_thread_id) {
+                return threadInitialize();
+            } else @setCold(true);
+            assert(!initialized);
+            defer threadInitialize(); // initialise this thread after everything else is set up.
+
             initialized = true;
             mapFailCallback = config.mapFailCallback;
 
             if (config.backing_allocator) |ally| {
-                // this is safe because this field is always null if this is
-                // really a pointer to constant memory.
-                comptime assert(cfg.backing_allocator == .runtime);
                 dangerousCastAwayConst(backing_allocator).* = ally;
-            } else if (cfg.backing_allocator == .runtime) {
+            } else if (!known_allocator) {
                 @panic("Must specify backing allocator with runtime allocator");
             }
 
@@ -144,8 +149,13 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             }
             heap_reserve_count = if (span_map_count > default_span_map_count) default_span_map_count else span_map_count;
 
-            if (builtin.os.tag == .windows and (builtin.link_mode != .Dynamic)) {
-                fls_key = FlsAlloc(&threadDestructor);
+            // TODO: evaluate if this is worth doing.
+            if (is_windows_and_not_dynamic) {
+                fls_key = FlsAlloc(&struct {
+                    fn threadDestructor(value: ?*anyopaque) callconv(.Stdcall) void {
+                        if (value != null) threadFinalize(true);
+                    }
+                }.threadDestructor);
             }
 
             // Setup all small and medium size classes
@@ -172,15 +182,12 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             orphan_heaps = null;
             all_heaps = .{null} ** all_heaps.len;
             releaseLock(&global_lock);
-
-            //Initialize this thread
-            threadInitialize();
         }
 
         /// Finalize the allocator
         pub fn deinit() void {
+            assert(initialized);
             threadFinalize(true);
-            //rpmalloc_dump_statistics(stdout);
 
             if (global_reserve != null) {
                 _ = atomicAdd32(&global_reserve_master.?.remaining_spans, -@intCast(i32, global_reserve_count));
@@ -190,8 +197,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             }
             releaseLock(&global_lock);
 
-            // Free all thread caches and fully free spans
-            {
+            { // Free all thread caches and fully free spans
                 var list_idx: usize = 0;
                 while (list_idx < heap_array_size) : (list_idx += 1) {
                     var maybe_heap: ?*Heap = all_heaps[list_idx];
@@ -205,13 +211,14 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             }
 
             if (enable_global_cache) {
-                //Free global caches
+                // Free global caches
                 var iclass: usize = 0;
                 while (iclass < LARGE_CLASS_COUNT) : (iclass += 1) {
                     globalCacheFinalize(&global_span_cache[iclass]);
                 }
             }
 
+            // TODO: evaluate if this is worth doing
             if (is_windows_and_not_dynamic) {
                 FlsFree(fls_key);
                 fls_key = 0;
@@ -250,15 +257,11 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             deallocate(buf.ptr);
         }
 
-        var fls_key = if (is_windows_and_not_dynamic) @as(std.os.windows.DWORD, 0) else {};
+        var fls_key: std.os.windows.DWORD = if (is_windows_and_not_dynamic) 0 else @compileError("can't reference");
 
-        inline fn rpmalloc_assert(truth: bool, message: []const u8) void {
-            if (cfg.enable_asserts and !truth) @panic(message);
-        }
-
-        comptime {
-            if ((SMALL_GRANULARITY & (SMALL_GRANULARITY - 1)) != 0) @compileError("Small granularity must be power of two");
-            if ((SPAN_HEADER_SIZE & (SPAN_HEADER_SIZE - 1)) != 0) @compileError("Span header size must be power of two");
+        inline fn rpAssert(truth: bool, comptime message: []const u8) void {
+            if (options.enable_asserts and !truth) @panic(message);
+            assert(truth);
         }
 
         /// Maximum allocation size to avoid integer overflow
@@ -409,21 +412,24 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         };
 
         /// Default span size (64KiB)
-        const _memory_default_span_size = 64 * 1024;
-        const _memory_default_span_size_shift = std.math.log2(_memory_default_span_size);
-
+        const default_span_size = 64 * 1024;
+        const default_span_size_shift = std.math.log2(default_span_size);
         inline fn calculateSpanMask(input_span_size: anytype) uptr_t {
+            comptime if (@TypeOf(input_span_size) == comptime_int) {
+                return calculateSpanMask(@as(std.math.IntFittingRange(0, input_span_size), input_span_size));
+            };
+            assert(@popCount(input_span_size) == 1);
             return ~@as(uptr_t, input_span_size - 1);
         }
 
         // Global data
 
-        const backing_allocator: *const std.mem.Allocator = switch (cfg.backing_allocator) {
-            .specific => |specific| specific,
-            .runtime => &struct {
-                var val: std.mem.Allocator = undefined;
-            }.val,
-        };
+        /// Pointer to backing allocator. If one is specified at comptime,
+        /// this is a pointer to a comptime-known read-only interface.
+        /// Otherwise, this is actually a mutable pointer.
+        const backing_allocator: *const Allocator = options.backing_allocator orelse &struct {
+            var val: Allocator = undefined;
+        }.val;
 
         var initialized: bool = false;
         var main_thread_id: std.Thread.Id = 0;
@@ -435,16 +441,16 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         const map_granularity: usize = page_size;
 
         /// Size of a span of memory pages
-        const span_size: *const usize = if (!configurable_sizes) &@as(usize, _memory_default_span_size) else &struct {
-            var val: usize = _memory_default_span_size;
+        const span_size: *const usize = if (!configurable_sizes) &@as(usize, default_span_size) else &struct {
+            var val: usize = default_span_size;
         }.val;
         /// Shift to divide by span size
-        const span_size_shift: *const usize = if (!configurable_sizes) &@as(usize, _memory_default_span_size_shift) else &struct {
-            var val: usize = _memory_default_span_size_shift;
+        const span_size_shift: *const usize = if (!configurable_sizes) &@as(usize, default_span_size_shift) else &struct {
+            var val: usize = default_span_size_shift;
         }.val;
         /// Mask to get to start of a memory span
         const span_mask: *const uptr_t = if (!configurable_sizes) &calculateSpanMask(span_size.*) else &struct {
-            var val: uptr_t = calculateSpanMask(_memory_default_span_size);
+            var val: uptr_t = calculateSpanMask(default_span_size);
         }.val;
 
         /// Number of spans to map in each map call
@@ -487,7 +493,8 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         /// Fast thread ID
-        inline fn getThreadId() std.Thread.Id {
+        inline fn getThreadId() if (builtin.single_threaded) u0 else std.Thread.Id {
+            if (builtin.single_threaded) return 0;
             return std.Thread.getCurrentId();
         }
 
@@ -499,13 +506,6 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             }
         }
 
-        fn threadDestructor(value: ?*anyopaque) callconv(.Stdcall) void {
-            comptime assert(is_windows_and_not_dynamic);
-            if (value != null) {
-                threadFinalize(true);
-            }
-        }
-
         // Low level memory map/unmap
 
         /// Map more virtual memory
@@ -513,30 +513,27 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         /// offset receives the offset in bytes from start of mapped region
         /// returns address to start of mapped region to use
         fn memoryMap(size: usize, offset: *usize) ?*anyopaque {
-            rpmalloc_assert(size % page_size == 0, "Invalid mmap size");
-            rpmalloc_assert(size >= page_size, "Invalid mmap size");
+            assert(size != 0); // invalid mmap size
+            assert(size % page_size == 0); // invalid mmap size
             // Either size is a heap (a single page) or a (multiple) span - we only need to align spans, and only if larger than map granularity
-            const padding: usize = if ((size >= span_size.*) and (span_size.* > map_granularity)) span_size.* else 0;
-            rpmalloc_assert(size >= page_size, "Invalid mmap size");
+            const padding: usize = if (size >= span_size.* and span_size.* > map_granularity) span_size.* else 0;
             var ptr: ?*anyopaque = while (true) {
                 const ptr = backing_allocator.rawAlloc(size + padding, page_size_shift, @returnAddress()) orelse {
+                    // TODO: Should this be done, or should this just fail immediately?
                     if (mapFailCallback(size)) continue;
-                    break null;
+                    return null;
                 };
                 break ptr;
             };
             if (padding != 0) {
                 const final_padding: usize = padding - (@ptrToInt(ptr) & ~span_mask.*);
-                rpmalloc_assert(final_padding <= span_size.*, "Internal failure in padding");
-                rpmalloc_assert(final_padding <= padding, "Internal failure in padding");
-                rpmalloc_assert(final_padding % 8 == 0, "Internal failure in padding");
-                ptr = pointerOffset(ptr, final_padding).?;
+                assert(final_padding <= span_size.*);
+                assert(final_padding <= padding);
+                assert(final_padding % 8 == 0);
+                ptr = pointerOffset(ptr, final_padding);
                 offset.* = final_padding >> 3;
             }
-            rpmalloc_assert(
-                size < span_size.* or (@ptrToInt(ptr) & ~span_mask.*) == 0,
-                "Internal failure in padding",
-            );
+            assert(size < span_size.* or (@ptrToInt(ptr) & ~span_mask.*) == 0);
             return ptr;
         }
 
@@ -549,13 +546,15 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             var address: *anyopaque = address_init orelse return;
             var offset = offset_init;
             var release = release_init;
-            assert(release != 0); // I don't think we want to/can do partial unmappings
 
-            rpmalloc_assert(release == 0 or (release >= size), "Invalid unmap size");
-            rpmalloc_assert(release == 0 or (release >= page_size), "Invalid unmap size");
-            rpmalloc_assert(release % page_size == 0, "Invalid unmap size");
-            rpmalloc_assert(release != 0 or (offset == 0), "Invalid unmap size");
-            rpmalloc_assert(size >= page_size, "Invalid unmap size");
+            // I don't think we want to/can do partial unmappings, and it
+            // seems like the zig stdlib discourages it as well.
+            assert(release != 0);
+            assert(release == 0 or (release >= size)); // Invalid unmap size
+            assert(release == 0 or (release >= page_size)); // Invalid unmap size
+            assert(release % page_size == 0); // Invalid unmap size
+            assert(release != 0 or (offset == 0)); // Invalid unmap size
+            assert(size >= page_size); // Invalid unmap size
 
             if (release != 0 and offset != 0) {
                 offset <<= 3;
@@ -572,7 +571,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
 
         /// Declare the span to be a subspan and store distance from master span and span count
         fn spanMarkAsSubspanUnlessMaster(master: *Span, subspan: *Span, span_count: usize) void {
-            rpmalloc_assert(subspan != master or subspan.flags.master, "Span master pointer and/or flag mismatch");
+            assert(subspan != master or subspan.flags.master); // Span master pointer and/or flag mismatch
             if (subspan != master) {
                 subspan.flags = .{ .subspan = true };
                 subspan.offset_from_master = @intCast(u32, std.math.shr(uptr_t, @bitCast(uptr_t, pointerDiff(subspan, master)), span_size_shift.*));
@@ -614,14 +613,14 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
 
         /// Pop head span from double linked list
         fn spanDoubleLinkListPopHead(head: **Span, span: *Span) void {
-            rpmalloc_assert(head.* == span, "Linked list corrupted");
+            assert(head.* == span); // Linked list corrupted
             const old_head: *Span = head.*;
             head.* = old_head.next.?;
         }
 
         /// Remove a span from double linked list
         fn spanDoubleLinkListRemove(maybe_head: *?*Span, span: *Span) void {
-            rpmalloc_assert(maybe_head.* != null, "Linked list corrupted");
+            assert(maybe_head.* != null); // Linked list corrupted
             const head = maybe_head;
             if (head.* == span) {
                 head.* = span.next;
@@ -685,7 +684,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 }
                 if (reserved_count > heap_reserve_count) {
                     // If huge pages or eager spam map count, the global reserve spin lock is held by caller, spanMap
-                    rpmalloc_assert(atomicLoad32(&global_lock) == 1, "Global spin lock not held as expected");
+                    assert(atomicLoad32(&global_lock) == 1); // Global spin lock not held as expected
                     const remain_count: usize = reserved_count - heap_reserve_count;
                     reserved_count = heap_reserve_count;
                     const remain_span: *Span = ptrAndAlignCast(*Span, pointerOffset(reserved_spans, reserved_count * span_size.*).?);
@@ -735,22 +734,23 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
 
         /// Unmap memory pages for the given number of spans (or mark as unused if no partial unmappings)
         fn spanUnmap(span: *Span) void {
-            rpmalloc_assert(span.flags.master or span.flags.subspan, "Span flag corrupted");
-            rpmalloc_assert(!span.flags.master or !span.flags.subspan, "Span flag corrupted");
+            assert(span.flags.master or span.flags.subspan); // Span flag corrupted
+            assert(!span.flags.master or !span.flags.subspan); // Span flag corrupted
 
             const is_master = span.flags.master;
             const master: *Span = if (!is_master)
                 ptrAndAlignCast(*Span, pointerOffset(span, -@intCast(iptr_t, @as(uptr_t, span.offset_from_master) * span_size.*)).?)
             else
                 span;
-            rpmalloc_assert(is_master or span.flags.subspan, "Span flag corrupted");
-            rpmalloc_assert(master.flags.master, "Span flag corrupted");
+            assert(is_master or span.flags.subspan); // Span flag corrupted
+            assert(master.flags.master); // Span flag corrupted
 
             const span_count: usize = span.span_count;
             if (!is_master) {
-                rpmalloc_assert(span.align_offset == 0, "Span align offset corrupted");
+                assert(span.align_offset == 0); // Span align offset corrupted
 
-                // TODO: partial unmapping doesn't really work with a generic backing allocator.
+                // TODO: partial unmapping doesn't really work with a generic backing allocator,
+                // and it seems like the zig stdlib discourages it as well.
                 if (false) {
                     // Directly unmap subspans (unless huge pages, in which case we defer and unmap entire page range with master)
                     if (span_size.* >= page_size) {
@@ -767,7 +767,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
 
             if (atomicAdd32(&master.remaining_spans, -@intCast(i32, span_count)) <= 0) {
                 // Everything unmapped, unmap the master span with release flag to unmap the entire range of the super span
-                rpmalloc_assert(master.flags.master and master.flags.subspan, "Span flag corrupted");
+                assert(master.flags.master and master.flags.subspan); // Span flag corrupted
                 var unmap_count: usize = master.span_count;
                 if (span_size.* < page_size) {
                     unmap_count = master.total_spans;
@@ -780,7 +780,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         /// as allocated, returning number of blocks in list
         fn freeListPartialInit(list: *?*anyopaque, first_block: *?*anyopaque, page_start: *anyopaque, block_start: *anyopaque, block_count_init: u32, block_size: u32) u32 {
             var block_count = block_count_init;
-            rpmalloc_assert(block_count != 0, "Internal failure");
+            assert(block_count != 0); // Internal failure
             first_block.* = block_start;
             if (block_count > 1) {
                 var free_block: ?*anyopaque = pointerOffset(block_start, block_size);
@@ -810,7 +810,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
 
         /// Initialize an unused span (from cache or mapped) to be new active span, putting the initial free list in heap class free list
         fn spanInitializeNew(heap: *Heap, heap_size_class: *HeapSizeClass, span: *Span, class_idx: u32) ?*anyopaque {
-            rpmalloc_assert(span.span_count == 1, "Internal failure");
+            assert(span.span_count == 1); // Internal failure
             const size_class: *SizeClass = &global_size_classes[class_idx];
             span.size_class = class_idx;
             span.heap = heap;
@@ -854,7 +854,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         }
 
         fn spanIsFullyUtilized(span: *Span) bool {
-            rpmalloc_assert(span.free_list_limit <= span.block_count, "Span free list corrupted");
+            assert(span.free_list_limit <= span.block_count); // Span free list corrupted
             return span.free_list == null and (span.free_list_limit >= span.block_count);
         }
 
@@ -883,8 +883,9 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 heap.size_class[iclass].free_list = null;
                 span.used_count -= free_count;
             }
+            // TODO: should this leak check be kept? And should it be an assertion?
             // If this assert triggers you have memory leaks
-            rpmalloc_assert(span.list_size == span.used_count, "Memory leak detected");
+            rpAssert(span.list_size == span.used_count, "Memory leak detected");
             if (span.list_size == span.used_count) {
                 // This function only used for spans in double linked lists
                 if (list_head != null) {
@@ -936,7 +937,13 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 insert_count = cache_limit - cache.count;
 
             // memcpy(cache->span + cache->count, span, sizeof(Span*) * insert_count);
-            memcpy(cache.span[cache.count..].ptr, span, @sizeOf(*Span) * insert_count);
+            std.mem.copy(
+                *Span,
+                // zig fmt: off
+                cache.span[cache.count..][0..insert_count],
+                span                     [0..insert_count],
+                // zig fmt: on
+            );
             cache.count += @intCast(u32, insert_count);
 
             while ( // zig fmt: off
@@ -1053,11 +1060,11 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             var maybe_span: ?*Span = atomicExchangePtrAcquire(&heap.span_free_deferred, null);
             while (maybe_span) |span| {
                 const next_span: ?*Span = ptrAndAlignCast(?*Span, span.free_list);
-                rpmalloc_assert(span.heap == heap, "Span heap pointer corrupted");
+                assert(span.heap == heap); // Span heap pointer corrupted
 
                 if (span.size_class < SIZE_CLASS_COUNT) {
                     @setCold(false);
-                    rpmalloc_assert(heap.full_span_count != 0, "Heap span counter corrupted");
+                    assert(heap.full_span_count != 0); // Heap span counter corrupted
                     heap.full_span_count -= 1;
                     if (single_span != null and single_span.?.* == null) {
                         @ptrCast(*?*Span, single_span).* = span;
@@ -1068,8 +1075,8 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                     if (span.size_class == SIZE_CLASS_HUGE) {
                         deallocateHuge(span);
                     } else {
-                        rpmalloc_assert(span.size_class == SIZE_CLASS_LARGE, "Span size class invalid");
-                        rpmalloc_assert(heap.full_span_count != 0, "Heap span counter corrupted");
+                        assert(span.size_class == SIZE_CLASS_LARGE); // Span size class invalid
+                        assert(heap.full_span_count != 0); // Heap span counter corrupted
                         heap.full_span_count -= 1;
                         const idx: u32 = span.span_count - 1;
                         if (idx == 0 and single_span != null and single_span.?.* == null) {
@@ -1330,8 +1337,10 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 .master_heap = null,
                 .span_large_cache = if (enable_thread_cache) [_]SpanLargeCache{.{ .count = 0, .span = undefined }} ** (LARGE_CLASS_COUNT - 1) else .{},
             };
-            //Get a new heap ID
-            heap.id = atomicIncr32(&heap_id_counter);
+            // TODO: `atomicIncr32` here returns the value of 'heap_id_counter' after it's incremented,
+            // which means adding 1 here makes the first id be '2'. Need to investigate if this is
+            // intentional, or if it is even a significant detail.
+            heap.id = 1 + atomicIncr32(&heap_id_counter);
 
             //Link in heap in heap ID map
             const list_idx: usize = @intCast(usize, heap.id) % heap_array_size;
@@ -1390,7 +1399,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             };
 
             var remain_size: usize = span_size.* - @sizeOf(Span);
-            const heap: *Heap = ptrAndAlignCast(*Heap, pointerOffset(span, @sizeOf(Span)).?);
+            const heap: *Heap = ptrAndAlignCast(*Heap, pointerOffset(span, @sizeOf(Span)));
             heapInitialize(heap);
 
             // Put extra heaps as orphans
@@ -1444,9 +1453,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             return heap;
         }
 
-        fn heapRelease(heapptr: ?*anyopaque, release_cache: bool) void {
-            const heap: *Heap = ptrAndAlignCast(*Heap, heapptr orelse return);
-
+        fn heapRelease(heap: *Heap, release_cache: bool) void {
             // Release thread cache spans back to global cache
             heapCacheAdoptDeferred(heap, null);
             if (enable_thread_cache) {
@@ -1486,13 +1493,10 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 acquireLock(&global_lock);
             }
             heapOrphan(heap);
-            if (getThreadId() != main_thread_id) {
-                releaseLock(&global_lock);
-            }
-        }
-
-        fn heapReleaseRaw(heapptr: ?*anyopaque, release_cache: bool) void {
-            heapRelease(heapptr, release_cache);
+            // TODO: the original source does this unconditionally, despite
+            // the lock being acquired conditionally, but I don't understand
+            // why or whether it's a good idea to do this.
+            releaseLock(&global_lock);
         }
 
         fn heapFinalize(heap: *Heap) void {
@@ -1544,7 +1548,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                     span_cache.count = 0;
                 }
             }
-            rpmalloc_assert(atomicLoadPtr(&heap.span_free_deferred) == null, "Heaps still active during finalization");
+            assert(atomicLoadPtr(&heap.span_free_deferred) == null); // Heaps still active during finalization
         }
 
         // Allocation entry points
@@ -1560,8 +1564,8 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         fn allocateFromHeapFallback(heap: *Heap, heap_size_class: *HeapSizeClass, class_idx: u32) ?*anyopaque {
             if (heap_size_class.partial_span) |span| {
                 @setCold(false);
-                rpmalloc_assert(span.block_count == global_size_classes[span.size_class].block_count, "Span block count corrupted");
-                rpmalloc_assert(!spanIsFullyUtilized(span), "Internal failure");
+                assert(span.block_count == global_size_classes[span.size_class].block_count); // Span block count corrupted
+                assert(!spanIsFullyUtilized(span)); // Internal failure
                 const block: *anyopaque = block: {
                     var block: ?*anyopaque = null;
                     if (span.free_list != null) {
@@ -1576,7 +1580,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                     }
                     break :block block.?;
                 };
-                rpmalloc_assert(span.free_list_limit <= span.block_count, "Span block count corrupted");
+                assert(span.free_list_limit <= span.block_count); // Span block count corrupted
                 span.used_count = span.free_list_limit;
 
                 // Swap in deferred free list if present
@@ -1645,7 +1649,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
             const span: *Span = heapExtractNewSpan(heap, null, span_count, SIZE_CLASS_LARGE) orelse return null;
 
             // Mark span as owned by this heap and set base data
-            rpmalloc_assert(span.span_count >= span_count, "Internal failure");
+            assert(span.span_count >= span_count); // Internal failure
             span.size_class = SIZE_CLASS_LARGE;
             span.heap = heap;
             heap.full_span_count += 1;
@@ -1705,7 +1709,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 // and size aligned to span header size multiples is less than size + alignment,
                 // then use natural alignment of blocks to provide alignment
                 const multiple_size: usize = if (size != 0) (size + (SPAN_HEADER_SIZE - 1)) & ~@as(uptr_t, SPAN_HEADER_SIZE - 1) else SPAN_HEADER_SIZE;
-                rpmalloc_assert(multiple_size % SPAN_HEADER_SIZE == 0, "Failed alignment calculation");
+                assert(multiple_size % SPAN_HEADER_SIZE == 0); // Failed alignment calculation
                 if (multiple_size <= (size + alignment)) {
                     return allocate(heap, multiple_size);
                 }
@@ -1806,8 +1810,8 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
         /// Deallocate the given small/medium memory block in the current thread local heap
         fn deallocateDirectSmallOrMedium(span: *Span, block: *align(@alignOf(*anyopaque)) anyopaque) void {
             const heap: *Heap = span.heap.?;
-            rpmalloc_assert(heap.owner_thread == getThreadId() or heap.owner_thread == 0 or heap.finalize != 0, "Internal failure");
-            //Add block to free list
+            assert(heap.owner_thread == getThreadId() or heap.owner_thread == 0 or heap.finalize != 0); // Internal failure
+            // Add block to free list
             if (spanIsFullyUtilized(span)) {
                 span.used_count = span.block_count;
                 spanDoubleLinkListAdd(&heap.size_class[span.size_class].partial_span, span);
@@ -1831,8 +1835,8 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                     atomicStorePtrRelease(&span.free_list_deferred, free_list);
                 }
                 spanDoubleLinkListRemove(&heap.size_class[span.size_class].partial_span, span);
-                rpmalloc_assert(span.size_class < SIZE_CLASS_COUNT, "Invalid span size class");
-                rpmalloc_assert(span.span_count == 1, "Invalid span count");
+                assert(span.size_class < SIZE_CLASS_COUNT); // Invalid span size class
+                assert(span.span_count == 1); // Invalid span count
                 if (heap.finalize == 0) {
                     if (heap.size_class[span.size_class].cache) |cache| {
                         heapCacheInsert(heap, cache);
@@ -1897,9 +1901,9 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
 
         /// Deallocate the given large memory block to the current heap
         fn deallocateLarge(span: *Span) void {
-            rpmalloc_assert(span.size_class == SIZE_CLASS_LARGE, "Bad span size class");
-            rpmalloc_assert(!span.flags.master or !span.flags.subspan, "Span flag corrupted");
-            rpmalloc_assert(span.flags.master or span.flags.subspan, "Span flag corrupted");
+            assert(span.size_class == SIZE_CLASS_LARGE); // Bad span size class
+            assert(!span.flags.master or !span.flags.subspan); // Span flag corrupted
+            assert(span.flags.master or span.flags.subspan); // Span flag corrupted
             //We must always defer (unless finalizing) if from another heap since we cannot touch the list or counters of another heap
             const defer_dealloc: bool = (span.heap.?.owner_thread != getThreadId()) and span.heap.?.finalize == 0;
 
@@ -1907,7 +1911,7 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 deallocateDeferFreeSpan(span.heap.?, span);
                 return;
             }
-            rpmalloc_assert(span.heap.?.full_span_count != 0, "Heap span counter corrupted");
+            assert(span.heap.?.full_span_count != 0); // Heap span counter corrupted
             span.heap.?.full_span_count -= 1;
 
             const heap: *Heap = span.heap.?;
@@ -1924,8 +1928,8 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 } else { //SPAN_FLAG_SUBSPAN
                     const master: *Span = ptrAndAlignCast(*Span, pointerOffset(span, -@intCast(iptr_t, @as(usize, span.offset_from_master) * span_size.*)).?);
                     heap.span_reserve_master = master;
-                    rpmalloc_assert(master.flags.master, "Span flag corrupted");
-                    rpmalloc_assert(atomicLoad32(&master.remaining_spans) >= span.span_count, "Master span count corrupted");
+                    assert(master.flags.master); // Span flag corrupted
+                    assert(atomicLoad32(&master.remaining_spans) >= span.span_count); // Master span count corrupted
                 }
             } else {
                 //Insert into cache list
@@ -1940,10 +1944,10 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
                 deallocateDeferFreeSpan(span.heap.?, span);
                 return;
             }
-            rpmalloc_assert(span.heap.?.full_span_count != 0, "Heap span counter corrupted");
+            assert(span.heap.?.full_span_count != 0); // Heap span counter corrupted
             span.heap.?.full_span_count -= 1;
 
-            //Oversized allocation, page count is stored in span_count
+            // Oversized allocation, page count is stored in span_count
             const num_pages: usize = span.span_count;
             memoryUnmap(span, num_pages * page_size, span.align_offset, num_pages * page_size);
         }
@@ -2012,33 +2016,32 @@ pub fn RPMemoryAllocator(comptime cfg: RPMemoryAllocatorConfig) type {
 
         /// Initialize thread, assign heap
         fn threadInitialize() void {
-            if (getThreadHeapRaw() == null) {
-                if (heapAllocate()) |heap| {
-                    setThreadHeap(heap);
-                    if (is_windows_and_not_dynamic) {
-                        FlsSetValue(fls_key, heap);
-                    }
-                }
+            assert(!isThreadInitialized());
+            const heap = heapAllocate() orelse return;
+            setThreadHeap(heap);
+            if (is_windows_and_not_dynamic) {
+                FlsSetValue(fls_key, heap);
             }
         }
 
         /// Finalize thread, orphan heap
         fn threadFinalize(release_caches: bool) void {
+            assert(isThreadInitialized());
             if (getThreadHeapRaw()) |heap| {
-                heapReleaseRaw(heap, release_caches);
+                heapRelease(heap, release_caches);
+                setThreadHeap(null);
             }
-            setThreadHeap(null);
             if (is_windows_and_not_dynamic) {
                 FlsSetValue(fls_key, 0);
             }
         }
 
-        fn isThreadInitialized() bool {
+        inline fn isThreadInitialized() bool {
             return getThreadHeapRaw() != null;
         }
 
-        pub const Config = struct {
-            backing_allocator: if (cfg.backing_allocator == .runtime) ?std.mem.Allocator else ?noreturn = null,
+        pub const InitConfig = struct {
+            backing_allocator: ?if (known_allocator) noreturn else Allocator = null,
             /// Called when a call to map memory pages fails (out of memory). If this callback is
             /// not set or returns zero the library will return a null pointer in the allocation
             /// call. If this callback returns non-zero the map call will be retried. The argument
@@ -2105,105 +2108,42 @@ inline fn copyThenIncrement(x: anytype) @TypeOf(x.*) {
     return result;
 }
 
-inline fn memcpy(noalias dst: anytype, noalias src: anytype, size: usize) void {
-    @memcpy(@ptrCast([*]u8, dst), @ptrCast([*]const u8, src), size);
-}
-inline fn memmove(p_dst: anytype, p_src: anytype, size: usize) void {
-    const dst = @ptrCast([*]u8, p_dst)[0..size];
-    const src = @ptrCast([*]u8, p_src)[0..size];
-    switch (std.math.order(@ptrToInt(dst.ptr), @ptrToInt(src.ptr))) {
-        .eq => {},
-        .lt => std.mem.copy(u8, dst, src),
-        .gt => std.mem.copyBackwards(u8, dst, src),
-    }
-}
-
 const FlsAlloc = @compileError("windows stub");
 const FlsFree = @compileError("windows stub");
 const FlsSetValue = @compileError("windows stub");
-const GetLargePageMinimum = @compileError("windows stub");
-const OpenProcessToken = @compileError("windows stub");
-const LookupPrivilegeValue = @compileError("windows stub");
-const TOKEN_ADJUST_PRIVILEGES = @compileError("windows stub");
-const TOKEN_QUERY = @compileError("windows stub");
-const LUID = @compileError("windows stub");
-const SE_LOCK_MEMORY_NAME = @compileError("windows stub");
-const TOKEN_PRIVILEGES = @compileError("windows stub");
-const SE_PRIVILEGE_ENABLED = @compileError("windows stub");
-const AdjustTokenPrivileges = @compileError("windows stub");
 
-// typedef volatile _Atomic(int32_t) atomic32_t;
+// TODO: in the original source the typedef is 'volatile _Atomic(<int32_t|int64_t|void*>)',
+// but I'm not sure if it should be. Why do these atomics also need to be volatile?
 const atomic32_t = i32;
-// typedef volatile _Atomic(int64_t) atomic64_t;
 const atomic64_t = i64;
-// typedef volatile _Atomic(void*) atomicptr_t;
 
-// static FORCEINLINE int32_t atomic_load32(atomic32_t* src) { return atomic_load_explicit(src, memory_order_relaxed); }
-inline fn atomicLoad32(src: *const atomic32_t) atomic32_t {
+inline fn atomicLoad32(src: *const atomic32_t) i32 {
     return @atomicLoad(atomic32_t, src, .Monotonic);
 }
-
-// static FORCEINLINE void    atomic_store32(atomic32_t* dst, int32_t val) { atomic_store_explicit(dst, val, memory_order_relaxed); }
-inline fn atomicStore32(dst: *atomic32_t, val: atomic32_t) void {
+inline fn atomicStore32(dst: *atomic32_t, val: i32) void {
     @atomicStore(atomic32_t, dst, val, .Monotonic);
 }
-
-// static FORCEINLINE int32_t atomic_incr32(atomic32_t* val) { return atomic_fetch_add_explicit(val, 1, memory_order_relaxed) + 1; }
-inline fn atomicIncr32(val: *atomic32_t) atomic32_t {
-    return @atomicRmw(atomic32_t, val, .Add, 1, .Monotonic) + 1;
+inline fn atomicIncr32(val: *atomic32_t) i32 {
+    return @atomicRmw(atomic32_t, val, .Add, 1, .Monotonic) + 1; // TODO: should this use wrapping semantics
 }
-
-// static FORCEINLINE int32_t atomic_decr32(atomic32_t* val) { return atomic_fetch_add_explicit(val, -1, memory_order_relaxed) - 1; }
-inline fn atomicDecr32(val: *atomic32_t) atomic32_t {
-    return @atomicRmw(atomic32_t, val, .Sub, 1, .Monotonic) - 1;
+inline fn atomicDecr32(val: *atomic32_t) i32 {
+    return @atomicRmw(atomic32_t, val, .Sub, 1, .Monotonic) - 1; // TODO: should this use wrapping sematnics
 }
-
-// static FORCEINLINE int32_t atomic_add32(atomic32_t* val, int32_t add) { return atomic_fetch_add_explicit(val, add, memory_order_relaxed) + add; }
-inline fn atomicAdd32(val: *atomic32_t, add: atomic32_t) atomic32_t {
-    return @atomicRmw(atomic32_t, val, .Add, add, .Monotonic) + add;
+inline fn atomicAdd32(val: *atomic32_t, add: i32) i32 {
+    return @atomicRmw(atomic32_t, val, .Add, add, .Monotonic) + add; // TODO: should this use wrapping semantics
 }
-
-// static FORCEINLINE int     atomic_cas32_acquire(atomic32_t* dst, int32_t val, int32_t ref) { return atomic_compare_exchange_weak_explicit(dst, &ref, val, memory_order_acquire, memory_order_relaxed); }
-inline fn atomicCas32Acquire(dst: *atomic32_t, val: atomic32_t, ref: atomic32_t) bool {
-    return @cmpxchgWeak(atomic32_t, dst, ref, val, .Acquire, .Monotonic) == null;
-}
-
-// static FORCEINLINE void    atomic_store32_release(atomic32_t* dst, int32_t val) { atomic_store_explicit(dst, val, memory_order_release); }
-inline fn atomicStore32Release(dst: *atomic32_t, val: atomic32_t) void {
-    @atomicStore(atomic32_t, dst, val, .Release);
-}
-
-// static FORCEINLINE int64_t atomic_load64(atomic64_t* val) { return atomic_load_explicit(val, memory_order_relaxed); }
-inline fn atomicLoad64(val: *const atomic64_t) atomic64_t {
-    return @atomicLoad(atomic64_t, val, .Monotonic);
-}
-
-// static FORCEINLINE int64_t atomic_add64(atomic64_t* val, int64_t add) { return atomic_fetch_add_explicit(val, add, memory_order_relaxed) + add; }
-inline fn atomicAdd64(val: *atomic64_t, add: atomic64_t) atomic64_t {
-    return @atomicRmw(atomic64_t, val, .Add, add, .Monotonic) + add;
-}
-
-// static FORCEINLINE void*   atomic_load_ptr(atomicptr_t* src) { return atomic_load_explicit(src, memory_order_relaxed); }
 inline fn atomicLoadPtr(src: anytype) @TypeOf(src.*) {
     return @atomicLoad(@TypeOf(src.*), src, .Monotonic);
 }
-
-// static FORCEINLINE void    atomic_store_ptr(atomicptr_t* dst, void* val) { atomic_store_explicit(dst, val, memory_order_relaxed); }
 inline fn atomicStorePtr(dst: anytype, val: @TypeOf(dst.*)) void {
     @atomicStore(@TypeOf(dst.*), dst, val, .Monotonic);
 }
-
-// static FORCEINLINE void    atomic_store_ptr_release(atomicptr_t* dst, void* val) { atomic_store_explicit(dst, val, memory_order_release); }
 inline fn atomicStorePtrRelease(dst: anytype, val: @TypeOf(dst.*)) void {
     @atomicStore(@TypeOf(dst.*), dst, val, .Release);
 }
-
-// static FORCEINLINE void*   atomic_exchange_ptr_acquire(atomicptr_t* dst, void* val) { return atomic_exchange_explicit(dst, val, memory_order_acquire); }
 inline fn atomicExchangePtrAcquire(dst: anytype, val: @TypeOf(dst.*)) @TypeOf(dst.*) {
     return @atomicRmw(@TypeOf(dst.*), dst, .Xchg, val, .Acquire);
 }
-
-// static FORCEINLINE int     atomic_cas_ptr(atomicptr_t* dst, void* val, void* ref) { return atomic_compare_exchange_weak_explicit(dst, &ref, val, memory_order_relaxed, memory_order_relaxed); }
 inline fn atomicCasPtr(dst: anytype, val: @TypeOf(dst.*), ref: @TypeOf(dst.*)) bool {
     return @cmpxchgWeak(@TypeOf(dst.*), dst, ref, val, .Monotonic, .Monotonic) == null;
 }
@@ -2214,7 +2154,7 @@ inline fn acquireLock(lock: *i32) void {
     }
 }
 inline fn releaseLock(lock: *i32) void {
-    atomicStore32Release(lock, 0);
+    @atomicStore(atomic32_t, lock, 0, .Release);
 }
 
 const INVALID_POINTER = @intToPtr(*align(@alignOf(*anyopaque)) anyopaque, std.mem.alignBackward(std.math.maxInt(uptr_t), @alignOf(*anyopaque)));
@@ -2258,29 +2198,22 @@ const MAX_THREAD_SPAN_LARGE_CACHE = 100;
 /// Number of spans to transfer between thread and global cache for large spans
 const THREAD_SPAN_LARGE_CACHE_TRANSFER = 6;
 
+comptime {
+    if ((SMALL_GRANULARITY & (SMALL_GRANULARITY - 1)) != 0) @compileError("Small granularity must be power of two");
+    if ((SPAN_HEADER_SIZE & (SPAN_HEADER_SIZE - 1)) != 0) @compileError("Span header size must be power of two");
+}
+
 const SpanFlags = packed struct(u32) {
     /// Flag indicating span is the first (master) span of a split superspan
-    // C Name: SPAN_FLAG_MASTER
     master: bool = false,
     /// Flag indicating span is a secondary (sub) span of a split superspan
-    // C Name: SPAN_FLAG_SUBSPAN
     subspan: bool = false,
     /// Flag indicating span has blocks with increased alignment
-    // C Name: SPAN_FLAG_ALIGNED_BLOCKS
     aligned_blocks: bool = false,
     /// Flag indicating an unmapped master span
-    // C Name: SPAN_FLAG_UNMAPPED_MASTER
     unmapped_master: bool = false,
 
     _pad: enum(u28) { unset } = .unset,
-
-    inline fn value(flags: SpanFlags) u32 {
-        return @bitCast(u32, flags);
-    }
-
-    inline fn from(val: u32) SpanFlags {
-        return SpanFlags.from(val);
-    }
 };
 
 fn DangerousCastAwayConst(comptime Original: type) type {
