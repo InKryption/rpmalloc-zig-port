@@ -3,39 +3,6 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
-test {
-    try testAllocator(.{
-        .backing_allocator = &std.testing.allocator,
-        .configurable_sizes = true,
-        .enable_thread_cache = true,
-        .enable_global_cache = true,
-        .enable_unlimited_cache = true,
-    }, .{ .backing_allocator = null });
-}
-
-fn testAllocator(
-    comptime options: RPMallocOptions,
-    init_cfg: RPMalloc(options).InitConfig,
-) !void {
-    const Rp = RPMalloc(options);
-    try Rp.init(init_cfg);
-    defer Rp.deinit();
-    const allocator = Rp.allocator();
-
-    comptime var alignment: std.math.Log2Int(u29) = 1;
-    inline while ((1 << alignment) <= std.mem.page_size) : (alignment *= 2) {
-        var size: usize = 0;
-        while (size < std.mem.page_size) : (size += 1) {
-            var mem = try allocator.alignedAlloc(u8, 1 << alignment, size);
-            var resize_to: usize = 1;
-            while (allocator.resize(mem, resize_to)) : (resize_to += 1) {
-                mem.len = resize_to;
-            }
-            allocator.free(mem);
-        }
-    }
-}
-
 pub const RPMallocOptions = struct {
     /// Enable configuring sizes at runtime. Will introduce a very small
     /// overhead due to some size calculations not being compile time constants
