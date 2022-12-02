@@ -588,10 +588,10 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Pop head span from double linked list
-        fn spanDoubleLinkListPopHead(head: **Span, span: *Span) void {
+        fn spanDoubleLinkListPopHead(head: *?*Span, span: *Span) void {
             assert(head.* == span); // Linked list corrupted
-            const old_head: *Span = head.*;
-            head.* = old_head.next.?;
+            const old_head: *Span = head.*.?;
+            head.* = old_head.next;
         }
 
         /// Remove a span from double linked list
@@ -1567,7 +1567,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     return block;
                 }
                 // The span is fully utilized, unlink from partial list and add to fully utilized list
-                spanDoubleLinkListPopHead(@ptrCast(**Span, &heap_size_class.partial_span), span);
+                spanDoubleLinkListPopHead(&heap_size_class.partial_span, span);
                 heap.full_span_count += 1;
                 return block;
             }
