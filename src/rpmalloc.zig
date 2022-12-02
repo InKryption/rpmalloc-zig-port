@@ -71,12 +71,8 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
         /// Initialize the allocator and setup global data.
         pub fn init(config: InitConfig) error{}!void {
-            // TODO: Should we instead just expose `threadInitialize` as a separate function?
-            if (initialized and getThreadId() != main_thread_id) {
-                return threadInitialize();
-            } else @setCold(true);
+            @setCold(true);
             assert(!initialized);
-            defer threadInitialize(); // initialise this thread after everything else is set up.
 
             initialized = true;
             mapFailCallback = config.mapFailCallback;
@@ -149,6 +145,13 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             orphan_heaps = null;
             all_heaps = .{null} ** all_heaps.len;
             releaseLock(&global_lock);
+            threadInitialize(); // initialise this thread after everything else is set up.
+        }
+        pub inline fn initThread() error{}!void {
+            if (builtin.single_threaded) return;
+            assert(getThreadId() != main_thread_id);
+            assert(!isThreadInitialized());
+            threadInitialize();
         }
 
         /// Finalize the allocator
@@ -192,6 +195,12 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             }
 
             initialized = false;
+        }
+        pub inline fn deinitThread(release_caches: bool) void {
+            if (builtin.single_threaded) return;
+            assert(getThreadId() != main_thread_id);
+            assert(isThreadInitialized());
+            threadFinalize(release_caches);
         }
 
         fn alloc(state_ptr: *anyopaque, len: usize, ptr_align: u8, ret_addr: usize) ?[*]u8 {
@@ -399,7 +408,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }.val;
 
         var initialized: bool = false;
-        var main_thread_id: std.Thread.Id = 0;
+        var main_thread_id: if (builtin.single_threaded) u0 else std.Thread.Id = 0;
         var mapFailCallback: *const fn (size: usize) bool = undefined;
         const page_size: usize = std.mem.page_size;
         /// Shift to divide by page size
@@ -1984,7 +1993,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
         /// Initialize thread, assign heap
         fn threadInitialize() void {
-            assert(!isThreadInitialized());
             const heap = heapAllocate() orelse return;
             setThreadHeap(heap);
             if (is_windows_and_not_dynamic) {
@@ -1994,7 +2002,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
         /// Finalize thread, orphan heap
         fn threadFinalize(release_caches: bool) void {
-            assert(isThreadInitialized());
             if (getThreadHeapRaw()) |heap| {
                 heapRelease(heap, release_caches);
                 setThreadHeap(null);
