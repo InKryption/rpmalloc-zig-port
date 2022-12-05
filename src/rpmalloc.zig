@@ -481,25 +481,25 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         /// size is number of bytes to map
         /// offset receives the offset in bytes from start of mapped region
         /// returns address to start of mapped region to use
-        fn memoryMap(size: usize, offset: *usize) ?*anyopaque {
+        fn memoryMap(size: usize, offset: *usize) ?*align(page_size) anyopaque {
             assert(size != 0); // invalid mmap size
             assert(size % page_size == 0); // invalid mmap size
             // Either size is a heap (a single page) or a (multiple) span - we only need to align spans, and only if larger than map granularity
             const padding: usize = if (size >= span_size.* and span_size.* > map_granularity) span_size.* else 0;
-            var ptr: ?*anyopaque = while (true) {
-                const ptr = backing_allocator.rawAlloc(size + padding, page_size_shift, @returnAddress()) orelse {
+            var ptr: *align(page_size) anyopaque = while (true) {
+                const slice = backing_allocator.alignedAlloc(u8, page_size, size + padding) catch {
                     // TODO: Should this be done, or should this just fail immediately?
                     if (mapFailCallback(size)) continue;
                     return null;
                 };
-                break ptr;
+                break slice.ptr;
             };
             if (padding != 0) {
                 const final_padding: usize = padding - (@ptrToInt(ptr) & ~span_mask.*);
                 assert(final_padding <= span_size.*);
                 assert(final_padding <= padding);
                 assert(final_padding % 8 == 0);
-                ptr = pointerOffset(ptr, final_padding);
+                ptr = @alignCast(page_size, @ptrCast([*]align(page_size) u8, ptr) + final_padding);
                 offset.* = final_padding >> 3;
             }
             assert(size < span_size.* or (@ptrToInt(ptr) & ~span_mask.*) == 0);
@@ -779,7 +779,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Initialize an unused span (from cache or mapped) to be new active span, putting the initial free list in heap class free list
-        fn spanInitializeNew(heap: *Heap, heap_size_class: *HeapSizeClass, span: *Span, class_idx: u32) ?*anyopaque {
+        fn spanInitializeNew(heap: *Heap, heap_size_class: *HeapSizeClass, span: *Span, class_idx: u32) ?*align(@alignOf(*anyopaque)) anyopaque {
             assert(span.span_count == 1); // Internal failure
             const size_class: *SizeClass = &global_size_classes[class_idx];
             span.size_class = class_idx;
@@ -798,8 +798,8 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             atomicStorePtrRelease(&span.free_list_deferred, null);
 
             //Setup free list. Only initialize one system page worth of free blocks in list
-            var block: ?*anyopaque = undefined;
-            span.free_list_limit = freeListPartialInit(&heap_size_class.free_list, &block, span, pointerOffset(span, SPAN_HEADER_SIZE).?, size_class.block_count, size_class.block_size);
+            var block: ?*align(@alignOf(*anyopaque)) anyopaque = undefined;
+            span.free_list_limit = freeListPartialInit(&heap_size_class.free_list, &block, span, @ptrCast([*]u8, span) + SPAN_HEADER_SIZE, size_class.block_count, size_class.block_size);
             //Link span as partial if there remains blocks to be initialized as free list, or full if fully initialized
             if (span.free_list_limit < span.block_count) {
                 spanDoubleLinkListAdd(&heap_size_class.partial_span, span);
@@ -1525,20 +1525,20 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         // Allocation entry points
 
         /// Pop first block from a free list
-        fn freeListPop(list: *?*align(@alignOf(*anyopaque)) anyopaque) ?*anyopaque {
+        fn freeListPop(list: *?*align(@alignOf(*anyopaque)) anyopaque) ?*align(@alignOf(*anyopaque)) anyopaque {
             const block = list.*;
             list.* = @ptrCast(*?*align(@alignOf(*anyopaque)) anyopaque, block).*;
             return block;
         }
 
         /// Allocate a small/medium sized memory block from the given heap
-        fn allocateFromHeapFallback(heap: *Heap, heap_size_class: *HeapSizeClass, class_idx: u32) ?*anyopaque {
+        fn allocateFromHeapFallback(heap: *Heap, heap_size_class: *HeapSizeClass, class_idx: u32) ?*align(@alignOf(*anyopaque)) anyopaque {
             if (heap_size_class.partial_span) |span| {
                 @setCold(false);
                 assert(span.block_count == global_size_classes[span.size_class].block_count); // Span block count corrupted
                 assert(!spanIsFullyUtilized(span)); // Internal failure
-                const block: *anyopaque = block: {
-                    var block: ?*anyopaque = null;
+                const block: *align(@alignOf(*anyopaque)) anyopaque = block: {
+                    var block: ?*align(@alignOf(*anyopaque)) anyopaque = null;
                     if (span.free_list != null) {
                         //Span local free list is not empty, swap to size class free list
                         block = freeListPop(&span.free_list);
@@ -1546,7 +1546,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                         span.free_list = null;
                     } else {
                         //If the span did not fully initialize free list, link up another page worth of blocks
-                        const block_start: *anyopaque = pointerOffset(span, SPAN_HEADER_SIZE + (@as(usize, span.free_list_limit) * span.block_size)).?;
+                        const block_start = @ptrCast([*]u8, span) + (SPAN_HEADER_SIZE + (@as(usize, span.free_list_limit) * span.block_size));
                         span.free_list_limit += freeListPartialInit(&heap_size_class.free_list, &block, @intToPtr(*anyopaque, @ptrToInt(block_start) & ~(page_size - 1)), block_start, span.block_count - span.free_list_limit, span.block_size);
                     }
                     break :block block.?;
@@ -1579,7 +1579,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Allocate a small sized memory block from the given heap
-        fn allocateSmall(heap: *Heap, size: usize) ?*anyopaque {
+        fn allocateSmall(heap: *Heap, size: usize) ?*align(@alignOf(*anyopaque)) anyopaque {
             // Small sizes have unique size classes
             const class_idx: u32 = @intCast(u32, (size + (SMALL_GRANULARITY - 1)) >> SMALL_GRANULARITY_SHIFT);
             const heap_size_class: *HeapSizeClass = &heap.size_class[class_idx];
@@ -1591,7 +1591,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Allocate a medium sized memory block from the given heap
-        fn allocateMedium(heap: *Heap, size: usize) ?*anyopaque {
+        fn allocateMedium(heap: *Heap, size: usize) ?*align(@alignOf(*anyopaque)) anyopaque {
             // Calculate the size class index and do a dependent lookup of the final class index (in case of merged classes)
             const base_idx: u32 = @intCast(u32, SMALL_CLASS_COUNT + ((size - (SMALL_SIZE_LIMIT + 1)) >> MEDIUM_GRANULARITY_SHIFT));
             const class_idx: u32 = global_size_classes[base_idx].class_idx;
@@ -1604,7 +1604,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Allocate a large sized memory block from the given heap
-        fn allocateLarge(heap: *Heap, size_init: usize) ?*anyopaque {
+        fn allocateLarge(heap: *Heap, size_init: usize) ?*align(@alignOf(*anyopaque)) anyopaque {
             var size = size_init;
 
             // Calculate number of needed max sized spans (including header)
@@ -1625,11 +1625,11 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             span.heap = heap;
             heap.full_span_count += 1;
 
-            return pointerOffset(span, SPAN_HEADER_SIZE);
+            return @ptrCast([*]align(@alignOf(Span)) u8, span) + SPAN_HEADER_SIZE;
         }
 
         /// Allocate a huge block by mapping memory pages directly
-        fn allocateHuge(heap: *Heap, size_init: usize) ?*anyopaque {
+        fn allocateHuge(heap: *Heap, size_init: usize) ?*align(@alignOf(*anyopaque)) anyopaque {
             var size = size_init;
 
             heapCacheAdoptDeferred(heap, null);
@@ -1639,7 +1639,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 num_pages += 1;
             }
             var align_offset: usize = 0;
-            const span: *Span = ptrAndAlignCast(*Span, memoryMap(num_pages * page_size, &align_offset) orelse return null);
+            const span: *Span = @ptrCast(*Span, memoryMap(num_pages * page_size, &align_offset) orelse return null);
 
             // Store page count in span_count
             span.size_class = SIZE_CLASS_HUGE;
@@ -1648,11 +1648,11 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             span.heap = heap;
             heap.full_span_count += 1;
 
-            return pointerOffset(span, SPAN_HEADER_SIZE);
+            return @ptrCast([*]align(@alignOf(Span)) u8, span) + SPAN_HEADER_SIZE;
         }
 
         /// Allocate a block of the given size
-        fn allocate(heap: *Heap, size: usize) ?*anyopaque {
+        fn allocate(heap: *Heap, size: usize) ?*align(@alignOf(*anyopaque)) anyopaque {
             if (size <= SMALL_SIZE_LIMIT) {
                 @setCold(false);
                 return allocateSmall(heap, size);
@@ -1662,7 +1662,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             return allocateHuge(heap, size);
         }
 
-        fn alignedAllocate(heap: *Heap, alignment: usize, size: usize) ?*anyopaque {
+        fn alignedAllocate(heap: *Heap, alignment: usize, size: usize) ?*align(@alignOf(*anyopaque)) anyopaque {
             if (alignment <= SMALL_GRANULARITY) {
                 if (size >= maxAllocSize()) return null;
                 return allocate(heap, size);
@@ -1690,7 +1690,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             if (alignment <= page_size) {
                 var ptr = allocate(heap, size + alignment);
                 if (@ptrToInt(ptr) & align_mask != 0) {
-                    ptr = @intToPtr(*anyopaque, (@ptrToInt(ptr) & ~@as(usize, align_mask)) + alignment);
+                    ptr = @intToPtr(*align(@alignOf(*anyopaque)) anyopaque, (@ptrToInt(ptr) & ~@as(usize, align_mask)) + alignment);
                     //Mark as having aligned blocks
                     const span: *Span = @intToPtr(*Span, @ptrToInt(ptr) & span_mask.*);
                     span.flags.aligned_blocks = true;
@@ -1734,7 +1734,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 limit_pages = original_pages * 2;
             }
 
-            var ptr: ?*anyopaque = null;
+            var ptr: ?*align(@alignOf(*anyopaque)) anyopaque = null;
             var mapped_size: usize = undefined;
             var align_offset: usize = undefined;
             var span: *Span = undefined;
@@ -1744,10 +1744,10 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 mapped_size = num_pages * page_size;
 
                 span = ptrAndAlignCast(*Span, memoryMap(mapped_size, &align_offset) orelse return null);
-                ptr = pointerOffset(span, SPAN_HEADER_SIZE);
+                ptr = @ptrCast([*]align(@alignOf(Span)) u8, span) + SPAN_HEADER_SIZE;
 
                 if (@ptrToInt(ptr) & align_mask != 0) {
-                    ptr = @intToPtr(*anyopaque, (@ptrToInt(ptr) & ~@as(usize, align_mask)) + alignment);
+                    ptr = @intToPtr(*align(@alignOf(*anyopaque)) anyopaque, (@ptrToInt(ptr) & ~@as(usize, align_mask)) + alignment);
                 }
 
                 if ((@ptrToInt(ptr) - @ptrToInt(span)) >= span_size.* or
@@ -1865,22 +1865,21 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             }
         }
 
-        fn deallocateSmallOrMedium(span: *Span, p_init: *anyopaque) void {
+        fn deallocateSmallOrMedium(span: *Span, p_init: *align(@alignOf(*anyopaque)) anyopaque) void {
             var p = p_init;
             if (span.flags.aligned_blocks) {
                 // Realign pointer to block start
                 const blocks_start: *anyopaque = @ptrCast([*]u8, span) + SPAN_HEADER_SIZE;
                 const block_offset = @ptrToInt(p) - @ptrToInt(blocks_start);
-                p = ptrAndAlignCast(*anyopaque, @ptrCast([*]u8, p) - (block_offset % span.block_size));
+                p = ptrAndAlignCast(*align(@alignOf(*anyopaque)) anyopaque, @ptrCast([*]align(@alignOf(*anyopaque)) u8, p) - (block_offset % span.block_size));
             }
 
-            const p_aligned = @alignCast(@alignOf(*anyopaque), p);
             // Check if block belongs to this heap or if deallocation should be deferred
             const defer_dealloc: bool = (span.heap.owner_thread != getThreadId()) and span.heap.finalize == 0;
             if (!defer_dealloc) {
-                deallocateDirectSmallOrMedium(span, p_aligned);
+                deallocateDirectSmallOrMedium(span, p);
             } else {
-                deallocateDeferSmallOrMedium(span, p_aligned);
+                deallocateDeferSmallOrMedium(span, p);
             }
         }
 
