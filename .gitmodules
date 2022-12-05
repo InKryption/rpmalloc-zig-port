@@ -1,0 +1,3 @@
+[submodule "rpmalloc-benchmark"]
+	path = rpmalloc-benchmark
+	url = https://github.com/mjansson/rpmalloc-benchmark.git
