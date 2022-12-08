@@ -501,7 +501,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             if (padding != 0) {
                 const final_padding: usize = padding - (@ptrToInt(ptr) & ~span_mask.*);
                 assert(final_padding <= span_size.*);
-                assert(final_padding <= padding);
                 assert(final_padding % 8 == 0);
                 ptr = @alignCast(page_size, @ptrCast([*]align(page_size) u8, ptr) + final_padding);
                 offset.* = final_padding >> 3;
