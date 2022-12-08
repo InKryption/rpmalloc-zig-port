@@ -68,17 +68,15 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Initialize the allocator and setup global data.
-        pub fn init(config: InitConfig) error{}!void {
+        pub fn init(
+            ally: if (known_allocator) ?noreturn else Allocator,
+            config: InitConfig,
+        ) error{}!void {
             @setCold(true);
             assert(!initialized);
-
             initialized = true;
-            mapFailCallback = config.mapFailCallback;
-
-            if (config.backing_allocator) |ally| {
-                dangerousCastAwayConst(backing_allocator).* = ally;
-            } else if (!known_allocator) {
-                @panic("Must specify backing allocator with runtime allocator");
+            if (!known_allocator) {
+                backing_allocator_mut = ally;
             }
 
             const min_span_size: usize = 256;
@@ -90,13 +88,11 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             comptime assert(page_size >= min_span_size and page_size <= max_page_size);
 
             if (config.span_size != .default) {
-                // this is safe because this field is only ever not equal to `.default` if
-                // sizes are configurable, meaning these pointers are to mutable memory.
                 comptime assert(configurable_sizes);
-                dangerousCastAwayConst(span_size).* = @enumToInt(config.span_size);
-                dangerousCastAwayConst(span_size_shift).* = std.math.log2_int(usize, span_size.*);
-                dangerousCastAwayConst(span_mask).* = calculateSpanMask(span_size.*);
-            }
+                span_size_mut = @enumToInt(config.span_size);
+                span_size_shift_mut = std.math.log2_int(usize, span_size.*);
+                span_mask_mut = calculateSpanMask(span_size.*);
+            } // otherwise, they're either not confiburable, or they're already set to default values.
 
             span_map_count = if (config.span_map_count != 0)
                 config.span_map_count
@@ -120,28 +116,28 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             }
 
             // Setup all small and medium size classes
-            global_size_classes[0].block_size = SMALL_GRANULARITY;
-            adjustSizeClass(0);
-            var iclass: usize = 1;
-            while (iclass < SMALL_CLASS_COUNT) : (iclass += 1) {
-                const size: usize = iclass * SMALL_GRANULARITY;
-                global_size_classes[iclass].block_size = @intCast(u32, size);
-                adjustSizeClass(iclass);
+            if (configurable_sizes) {
+                globalSmallSizeClassesInit(&global_size_classes, span_size);
+            } else if (comptime builtin.mode == .Debug) {
+                var expected: [SIZE_CLASS_COUNT]SizeClass = std.mem.zeroes([SIZE_CLASS_COUNT]SizeClass);
+                globalSmallSizeClassesInit(&expected, span_size);
+                for (global_size_classes[0..SMALL_CLASS_COUNT]) |sz_class, i| {
+                    assert(std.meta.eql(sz_class, expected[i]));
+                }
             }
 
-            // At least two blocks per span, then fall back to large allocations
-            medium_size_limit = @min(MEDIUM_SIZE_LIMIT, (span_size.* - SPAN_HEADER_SIZE) >> 1);
-            iclass = 0;
+            if (configurable_sizes) {
+                // At least two blocks per span, then fall back to large allocations
+                medium_size_limit_runtime.* = calculateMediumSizeLimitRuntime(span_size.*);
+            }
+            var iclass: usize = 0;
             while (iclass < MEDIUM_CLASS_COUNT) : (iclass += 1) {
                 const size: usize = SMALL_SIZE_LIMIT + ((iclass + 1) * MEDIUM_GRANULARITY);
-                if (size > medium_size_limit) break;
+                if (size > medium_size_limit_runtime.*) break;
                 global_size_classes[SMALL_CLASS_COUNT + iclass].block_size = @intCast(u32, size);
-                adjustSizeClass(SMALL_CLASS_COUNT + iclass);
+                adjustSizeClass(SMALL_CLASS_COUNT + iclass, &global_size_classes, span_size);
             }
 
-            orphan_heaps = null;
-            all_heaps = .{null} ** all_heaps.len;
-            releaseLock(&global_lock);
             threadInitialize(); // initialise this thread after everything else is set up.
         }
         pub inline fn initThread() error{}!void {
@@ -387,11 +383,8 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         /// Default span size (64KiB)
         const default_span_size = 64 * 1024;
         const default_span_size_shift = std.math.log2(default_span_size);
-        inline fn calculateSpanMask(input_span_size: anytype) usize {
-            comptime if (@TypeOf(input_span_size) == comptime_int) {
-                return calculateSpanMask(@as(std.math.IntFittingRange(0, input_span_size), input_span_size));
-            };
-            assert(@popCount(input_span_size) == 1);
+        inline fn calculateSpanMask(input_span_size: anytype) @TypeOf(input_span_size) {
+            assert(@popCount(@as(std.math.IntFittingRange(0, input_span_size), input_span_size)) == 1);
             return ~@as(usize, input_span_size - 1);
         }
 
@@ -400,39 +393,51 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         /// Pointer to backing allocator. If one is specified at comptime,
         /// this is a pointer to a comptime-known read-only interface.
         /// Otherwise, this is actually a mutable pointer.
-        const backing_allocator: *const Allocator = options.backing_allocator orelse &struct {
-            var val: Allocator = undefined;
-        }.val;
+        const backing_allocator: *const Allocator = options.backing_allocator orelse &backing_allocator_mut;
+        var backing_allocator_mut: std.mem.Allocator = if (known_allocator) @compileError("Don't reference") else undefined;
 
         var initialized: bool = false;
         var main_thread_id: if (builtin.single_threaded) u0 else std.Thread.Id = 0;
-        var mapFailCallback: *const fn (size: usize) bool = undefined;
         const page_size: usize = std.mem.page_size;
         /// Shift to divide by page size
         const page_size_shift: std.math.Log2Int(usize) = std.math.log2_int(usize, page_size);
         /// Granularity at which memory pages are mapped by OS
         const map_granularity: usize = page_size;
 
+        /// Returns `*const Int` if `configurable_sizes`. Otherwise returns `*const comptime_int`.
+        fn ConfigurableIntPtr(comptime Int: type) type {
+            if (configurable_sizes) return *const Int;
+            return *const comptime_int;
+        }
+
         /// Size of a span of memory pages
-        const span_size: *const usize = if (!configurable_sizes) &@as(usize, default_span_size) else &struct {
-            var val: usize = default_span_size;
-        }.val;
+        const span_size: ConfigurableIntPtr(usize) = if (!configurable_sizes) &default_span_size else &span_size_mut;
+        var span_size_mut: usize = if (configurable_sizes) default_span_size else @compileError("Don't reference");
+
         /// Shift to divide by span size
-        const span_size_shift: *const std.math.Log2Int(usize) = if (!configurable_sizes) &@as(std.math.Log2Int(usize), default_span_size_shift) else &struct {
-            var val: std.math.Log2Int(usize) = default_span_size_shift;
-        }.val;
+        const span_size_shift: ConfigurableIntPtr(std.math.Log2Int(usize)) = if (!configurable_sizes) &default_span_size_shift else &span_size_shift_mut;
+        var span_size_shift_mut: std.math.Log2Int(usize) = if (configurable_sizes) default_span_size_shift else @compileError("Don't reference");
+
         /// Mask to get to start of a memory span
-        const span_mask: *const usize = if (!configurable_sizes) &calculateSpanMask(span_size.*) else &struct {
-            var val: usize = calculateSpanMask(default_span_size);
-        }.val;
+        const span_mask: ConfigurableIntPtr(usize) = if (!configurable_sizes) &calculateSpanMask(span_size.*) else &span_mask_mut;
+        var span_mask_mut: usize = if (configurable_sizes) calculateSpanMask(default_span_size) else @compileError("Don't reference");
 
         /// Number of spans to map in each map call
         var span_map_count: usize = 0;
         /// Number of spans to keep reserved in each heap
         var heap_reserve_count: usize = 0;
-        var global_size_classes: [SIZE_CLASS_COUNT]SizeClass = std.mem.zeroes([SIZE_CLASS_COUNT]SizeClass);
+        var global_size_classes: [SIZE_CLASS_COUNT]SizeClass = blk: {
+            var global_size_classes_init = [_]SizeClass{.{ .block_size = 0, .block_count = 0, .class_idx = 0 }} ** SIZE_CLASS_COUNT;
+            if (!configurable_sizes) {
+                globalSmallSizeClassesInit(&global_size_classes_init, span_size);
+            }
+            break :blk global_size_classes_init;
+        };
+
         /// Run-time size limit of medium blocks
-        var medium_size_limit: usize = 0;
+        const medium_size_limit_runtime: ConfigurableIntPtr(usize) = if (!configurable_sizes) &calculateMediumSizeLimitRuntime(span_size.*) else &medium_size_limit_runtime_mut;
+        var medium_size_limit_runtime_mut: usize = if (configurable_sizes) undefined else @compileError("Don't reference");
+
         var heap_id_counter: i32 = 0; // atomic
 
         var global_span_cache = if (enable_global_cache) ([_]GlobalCache{.{
@@ -485,27 +490,27 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         /// size is number of bytes to map
         /// offset receives the offset in bytes from start of mapped region
         /// returns address to start of mapped region to use
-        fn memoryMap(size: usize, offset: *usize) ?*align(page_size) anyopaque {
+        inline fn memoryMap(size: usize, offset: *usize) ?*align(page_size) anyopaque {
             assert(size != 0); // invalid mmap size
             assert(size % page_size == 0); // invalid mmap size
             // Either size is a heap (a single page) or a (multiple) span - we only need to align spans, and only if larger than map granularity
             const padding: usize = if (size >= span_size.* and span_size.* > map_granularity) span_size.* else 0;
-            var ptr: *align(page_size) anyopaque = while (true) {
-                const ptr = backing_allocator.rawAlloc(size + padding, comptime std.math.log2_int(usize, page_size), @returnAddress()) orelse {
-                    // TODO: Should this be done, or should this just fail immediately?
-                    if (mapFailCallback(size)) continue;
-                    return null;
-                };
-                break @alignCast(page_size, ptr);
+            var ptr: *align(page_size) anyopaque = blk: {
+                const ptr = backing_allocator.rawAlloc(
+                    size + padding,
+                    comptime std.math.log2_int(usize, page_size),
+                    @returnAddress(),
+                ) orelse return null;
+                break :blk @alignCast(page_size, ptr);
             };
             if (padding != 0) {
-                const final_padding: usize = padding - (@ptrToInt(ptr) & ~span_mask.*);
+                const final_padding: usize = padding - (@ptrToInt(ptr) & ~@as(usize, span_mask.*));
                 assert(final_padding <= span_size.*);
                 assert(final_padding % 8 == 0);
-                ptr = @alignCast(page_size, @ptrCast([*]align(page_size) u8, ptr) + final_padding);
+                ptr = @alignCast(page_size, @ptrCast([*]u8, ptr) + final_padding);
                 offset.* = final_padding >> 3;
             }
-            assert(size < span_size.* or (@ptrToInt(ptr) & ~span_mask.*) == 0);
+            assert(size < span_size.* or (@ptrToInt(ptr) & ~@as(usize, span_mask.*)) == 0);
             return ptr;
         }
 
@@ -514,35 +519,30 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         /// size is the number of bytes to unmap, which might be less than full region for a partial unmap
         /// offset is the offset in bytes to the actual mapped region, as set by _memory_map
         /// release is set to 0 for partial unmap, or size of entire range for a full unmap
-        fn memoryUnmap(address_init: ?*anyopaque, size: usize, offset_init: usize, release_init: usize) void {
+        inline fn memoryUnmap(address_init: ?*anyopaque, offset: usize, release_init: usize) void {
             var address: *anyopaque = address_init orelse return;
-            var offset = offset_init;
             var release = release_init;
 
             // I don't think we want to/can do partial unmappings, and it
             // seems like the zig stdlib discourages it as well.
             assert(release != 0);
-            assert(release == 0 or (release >= size)); // Invalid unmap size
-            assert(release == 0 or (release >= page_size)); // Invalid unmap size
+            assert(offset != 0);
+            assert(release >= page_size); // Invalid unmap size
             assert(release % page_size == 0); // Invalid unmap size
-            assert(release != 0 or (offset == 0)); // Invalid unmap size
-            assert(size >= page_size); // Invalid unmap size
 
-            if (release != 0 and offset != 0) {
-                offset <<= 3;
-                address = pointerOffset(address, -@intCast(isize, offset)).?;
-                if ((release >= span_size.*) and (span_size.* > map_granularity)) {
-                    // Padding is always one span size
-                    release += span_size.*;
-                }
+            address = @ptrCast([*]u8, address) - (offset << 3);
+            if ((release >= span_size.*) and (span_size.* > map_granularity)) {
+                // Padding is always one span size
+                release += span_size.*;
             }
+
             if (!disable_unmap) {
                 backing_allocator.rawFree(@ptrCast([*]u8, address)[0..release], page_size_shift, @returnAddress());
             }
         }
 
         /// Declare the span to be a subspan and store distance from master span and span count
-        fn spanMarkAsSubspanUnlessMaster(master: *Span, subspan: *Span, span_count: usize) void {
+        inline fn spanMarkAsSubspanUnlessMaster(master: *Span, subspan: *Span, span_count: usize) void {
             assert(subspan != master or subspan.flags.master); // Span master pointer and/or flag mismatch
             if (subspan != master) {
                 subspan.flags = .{ .subspan = true };
@@ -554,7 +554,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Use global reserved spans to fulfill a memory map request (reserve size must be checked by caller)
-        fn globalGetReservedSpans(span_count: usize) ?*Span {
+        inline fn globalGetReservedSpans(span_count: usize) ?*Span {
             const span: *Span = global_reserve.?;
             spanMarkAsSubspanUnlessMaster(global_reserve_master.?, span, span_count);
             global_reserve_count -= span_count;
@@ -567,7 +567,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Store the given spans as global reserve (must only be called from within new heap allocation, not thread safe)
-        fn globalSetReservedSpans(master: *Span, reserve: *Span, reserve_span_count: usize) void {
+        inline fn globalSetReservedSpans(master: *Span, reserve: *Span, reserve_span_count: usize) void {
             global_reserve_master = master;
             global_reserve_count = reserve_span_count;
             global_reserve = reserve;
@@ -576,7 +576,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         // Span linked list management
 
         /// Add a span to double linked list at the head
-        fn spanDoubleLinkListAdd(head: *?*Span, span: *Span) void {
+        inline fn spanDoubleLinkListAdd(head: *?*Span, span: *Span) void {
             if (head.*) |h| {
                 h.prev = span;
             }
@@ -585,14 +585,14 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Pop head span from double linked list
-        fn spanDoubleLinkListPopHead(head: *?*Span, span: *Span) void {
+        inline fn spanDoubleLinkListPopHead(head: *?*Span, span: *Span) void {
             assert(head.* == span); // Linked list corrupted
             const old_head: *Span = head.*.?;
             head.* = old_head.next;
         }
 
         /// Remove a span from double linked list
-        fn spanDoubleLinkListRemove(maybe_head: *?*Span, span: *Span) void {
+        inline fn spanDoubleLinkListRemove(maybe_head: *?*Span, span: *Span) void {
             assert(maybe_head.* != null); // Linked list corrupted
             const head = maybe_head;
             if (head.* == span) {
@@ -612,7 +612,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         // Span control
 
         /// Use reserved spans to fulfill a memory map request (reserve size must be checked by caller)
-        fn spanMapFromReserve(heap: *Heap, span_count: usize) ?*Span {
+        inline fn spanMapFromReserve(heap: *Heap, span_count: usize) ?*Span {
             //Update the heap span reserve
             const span: ?*Span = heap.span_reserve;
             heap.span_reserve = ptrAndAlignCast(?*Span, @ptrCast([*]u8, span) + (span_count * span_size.*));
@@ -622,7 +622,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Get the aligned number of spans to map in based on wanted count, configured mapping granularity and the page size
-        fn spanAlignCount(span_count: usize) usize {
+        inline fn spanAlignCount(span_count: usize) usize {
             var request_count: usize = if (span_count > span_map_count) span_count else span_map_count;
             if ((page_size > span_size.*) and ((request_count * span_size.*) % page_size) != 0) {
                 request_count += span_map_count - (request_count % span_map_count);
@@ -631,7 +631,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Setup a newly mapped span
-        fn spanInitialize(span: *Span, total_span_count: usize, span_count: usize, align_offset: usize) void {
+        inline fn spanInitialize(span: *Span, total_span_count: usize, span_count: usize, align_offset: usize) void {
             span.total_spans = @intCast(u32, total_span_count);
             span.span_count = @intCast(u32, span_count);
             span.align_offset = @intCast(u32, align_offset);
@@ -674,7 +674,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Map in memory pages for the given number of spans (or use previously reserved pages)
-        fn spanMap(heap: *Heap, span_count: usize) ?*Span {
+        inline fn spanMap(heap: *Heap, span_count: usize) ?*Span {
             @setCold(true);
             if (span_count <= heap.spans_reserved)
                 return spanMapFromReserve(heap, span_count);
@@ -689,7 +689,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     span = globalGetReservedSpans(reserve_count);
                     if (span != null) {
                         if (reserve_count > span_count) {
-                            const reserved_span: *Span = ptrAndAlignCast(*Span, @ptrCast([*]u8, span) + std.math.shl(usize, span_count, span_size_shift.*));
+                            const reserved_span: *Span = ptrAndAlignCast(*Span, @ptrCast([*]u8, span) + (span_count << span_size_shift.*));
                             heapSetReservedSpans(heap, global_reserve_master, reserved_span, reserve_count - span_count);
                         }
                         // Already marked as subspan in globalGetReservedSpans
@@ -728,25 +728,24 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 if (false) {
                     // Directly unmap subspans (unless huge pages, in which case we defer and unmap entire page range with master)
                     if (span_size.* >= page_size) {
-                        memoryUnmap(span, span_count * span_size.*, span.align_offset, 0);
+                        memoryUnmap(span, span.align_offset, 0);
                     }
                 }
             } else {
                 // Special double flag to denote an unmapped master
                 // It must be kept in memory since span header must be used
-                span.flags.master = true;
-                span.flags.subspan = true;
-                span.flags.unmapped_master = true;
+                span.flags = .{
+                    .aligned_blocks = span.flags.aligned_blocks,
+                    .master = true,
+                    .subspan = true,
+                    .unmapped_master = true,
+                };
             }
 
             if (atomicAdd32(&master.remaining_spans, -@intCast(i32, span_count)) <= 0) {
                 // Everything unmapped, unmap the master span with release flag to unmap the entire range of the super span
                 assert(master.flags.master and master.flags.subspan); // Span flag corrupted
-                var unmap_count: usize = master.span_count;
-                if (span_size.* < page_size) {
-                    unmap_count = master.total_spans;
-                }
-                memoryUnmap(master, unmap_count * span_size.*, master.align_offset, @as(usize, master.total_spans) * span_size.*);
+                memoryUnmap(master, master.align_offset, @as(usize, master.total_spans) * span_size.*);
             }
         }
 
@@ -830,7 +829,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             atomicStorePtrRelease(&span.free_list_deferred, null);
         }
 
-        fn spanIsFullyUtilized(span: *Span) bool {
+        inline fn spanIsFullyUtilized(span: *Span) bool {
             assert(span.free_list_limit <= span.block_count); // Span free list corrupted
             return span.free_list == null and (span.free_list_limit >= span.block_count);
         }
@@ -932,18 +931,13 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             releaseLock(&cache.lock);
 
             var keep: ?*Span = null;
-            {
-                // var ispan: usize = insert_count;
-                // while (ispan < count) : (ispan += 1) {
-                //     const current_span: *Span = span[ispan];
-                for (span[insert_count..count]) |current_span| {
-                    // Keep master spans that has remaining subspans to avoid dangling them
-                    if (current_span.flags.master and (atomicLoad32(&current_span.remaining_spans) > current_span.span_count)) {
-                        current_span.next = keep;
-                        keep = current_span;
-                    } else {
-                        spanUnmap(current_span);
-                    }
+            for (span[insert_count..count]) |current_span| {
+                // Keep master spans that has remaining subspans to avoid dangling them
+                if (current_span.flags.master and (atomicLoad32(&current_span.remaining_spans) > current_span.span_count)) {
+                    current_span.next = keep;
+                    keep = current_span;
+                } else {
+                    spanUnmap(current_span);
                 }
             }
 
@@ -990,13 +984,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             const want: usize = @min(count - extract_count, cache.count);
 
             // memcpy(span + extract_count, cache->span + (cache->count - want), sizeof(span_t*) * want);
-            // std.mem.copy(
-            //     *Span,
-            //     // zig fmt: off
-            //     (span + extract_count)               [0..want],
-            //     cache.span[cache.count - want ..].ptr[0..want],
-            //     // zig fmt: on
-            // );
             for ((span + extract_count)[0..want]) |*dst, i| {
                 dst.* = @as([*]*Span, &cache.span)[cache.count - want .. want][i];
             }
@@ -1012,10 +999,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             }
 
             if (std.debug.runtime_safety) {
-                // var ispan: usize = 0;
-                // while (ispan < extract_count) : (ispan += 1) {
-                //     assert(span[ispan].span_count == span_count);
-                // }
                 for (span[0..extract_count]) |span_elem| {
                     assert(span_elem.span_count == span_count);
                 }
@@ -1027,7 +1010,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         // Heap control
 
         /// Store the given spans as reserve in the given heap
-        fn heapSetReservedSpans(heap: *Heap, master: ?*Span, reserve: ?*Span, reserve_span_count: usize) void {
+        inline fn heapSetReservedSpans(heap: *Heap, master: ?*Span, reserve: ?*Span, reserve_span_count: usize) void {
             heap.span_reserve_master = master;
             heap.span_reserve = reserve;
             heap.spans_reserved = @intCast(u32, reserve_span_count);
@@ -1205,7 +1188,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             return null;
         }
 
-        fn heapThreadCacheDeferredExtract(heap: *Heap, span_count: usize) ?*Span {
+        inline fn heapThreadCacheDeferredExtract(heap: *Heap, span_count: usize) ?*Span {
             var span: ?*Span = null;
             if (span_count == 1) {
                 heapCacheAdoptDeferred(heap, &span);
@@ -1216,7 +1199,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             return span;
         }
 
-        fn heapReservedExtract(heap: *Heap, span_count: usize) ?*Span {
+        inline fn heapReservedExtract(heap: *Heap, span_count: usize) ?*Span {
             if (heap.spans_reserved >= span_count) {
                 return spanMapFromReserve(heap, span_count);
             }
@@ -1224,8 +1207,9 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Extract a span from the global cache
-        fn heapGlobalCacheExtract(heap: *Heap, span_count: usize) ?*Span {
+        inline fn heapGlobalCacheExtract(heap: *Heap, span_count: usize) ?*Span {
             if (enable_global_cache) {
+                assert(span_count != 0);
                 if (enable_thread_cache) {
                     var span_cache: *SpanCache = undefined;
                     var wanted_count: usize = undefined;
@@ -1297,7 +1281,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             return spanMap(heap, base_span_count);
         }
 
-        fn heapInitialize(heap: *Heap) void {
+        inline fn heapInitialize(heap: *Heap) void {
             heap.* = comptime Heap{
                 .owner_thread = 0,
                 .size_class = [_]HeapSizeClass{.{ .free_list = null, .partial_span = null, .cache = null }} ** SIZE_CLASS_COUNT,
@@ -1326,7 +1310,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             all_heaps[list_idx] = heap;
         }
 
-        fn heapOrphan(heap: *Heap) void {
+        inline fn heapOrphan(heap: *Heap) void {
             heap.owner_thread = std.math.maxInt(usize);
             const heap_list: *?*Heap = &orphan_heaps;
             heap.next_orphan = heap_list.*;
@@ -1334,7 +1318,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Allocate a new heap from newly mapped memory pages
-        fn heapAllocateNew() ?*Heap {
+        inline fn heapAllocateNew() ?*Heap {
             // Map in pages for a 16 heaps. If page size is greater than required size for this, map a page and
             // use first part for heaps and remaining part for spans for allocations. Adds a lot of complexity,
             // but saves a lot of memory on systems where page size > 64 spans (4MiB)
@@ -1409,14 +1393,14 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             return heap;
         }
 
-        fn heapExtractOrphan(heap_list: *?*Heap) ?*Heap {
+        inline fn heapExtractOrphan(heap_list: *?*Heap) ?*Heap {
             const heap: ?*Heap = heap_list.*;
             heap_list.* = if (heap) |heap_unwrapped| heap_unwrapped.next_orphan else null;
             return heap;
         }
 
         /// Allocate a new heap, potentially reusing a previously orphaned heap
-        fn heapAllocate() ?*Heap {
+        inline fn heapAllocate() ?*Heap {
             acquireLock(&global_lock);
             defer releaseLock(&global_lock);
             const maybe_heap = heapExtractOrphan(&orphan_heaps) orelse heapAllocateNew();
@@ -1424,7 +1408,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             return maybe_heap;
         }
 
-        fn heapRelease(heap: *Heap, release_cache: bool) void {
+        inline fn heapRelease(heap: *Heap, release_cache: bool) void {
             // Release thread cache spans back to global cache
             heapCacheAdoptDeferred(heap, null);
             if (enable_thread_cache) {
@@ -1474,7 +1458,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             releaseLock(&global_lock);
         }
 
-        fn heapFinalize(heap: *Heap) void {
+        inline fn heapFinalize(heap: *Heap) void {
             if (heap.spans_reserved != 0) {
                 const span: *Span = spanMapFromReserve(heap, heap.spans_reserved).?;
                 spanUnmap(span);
@@ -1529,7 +1513,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         // Allocation entry points
 
         /// Pop first block from a free list
-        fn freeListPop(list: *?*align(SMALL_GRANULARITY) anyopaque) ?*align(SMALL_GRANULARITY) anyopaque {
+        inline fn freeListPop(list: *?*align(SMALL_GRANULARITY) anyopaque) ?*align(SMALL_GRANULARITY) anyopaque {
             const block = list.*;
             list.* = @ptrCast(*?*align(SMALL_GRANULARITY) anyopaque, block).*;
             return block;
@@ -1590,7 +1574,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Allocate a small sized memory block from the given heap
-        fn allocateSmall(heap: *Heap, size: usize) ?*align(SMALL_GRANULARITY) anyopaque {
+        inline fn allocateSmall(heap: *Heap, size: usize) ?*align(SMALL_GRANULARITY) anyopaque {
             // Small sizes have unique size classes
             const class_idx: u32 = @intCast(u32, (size + (SMALL_GRANULARITY - 1)) >> SMALL_GRANULARITY_SHIFT);
             const heap_size_class: *HeapSizeClass = &heap.size_class[class_idx];
@@ -1602,7 +1586,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Allocate a medium sized memory block from the given heap
-        fn allocateMedium(heap: *Heap, size: usize) ?*align(SMALL_GRANULARITY) anyopaque {
+        inline fn allocateMedium(heap: *Heap, size: usize) ?*align(SMALL_GRANULARITY) anyopaque {
             // Calculate the size class index and do a dependent lookup of the final class index (in case of merged classes)
             const base_idx: u32 = @intCast(u32, SMALL_CLASS_COUNT + ((size - (SMALL_SIZE_LIMIT + 1)) >> MEDIUM_GRANULARITY_SHIFT));
             const class_idx: u32 = global_size_classes[base_idx].class_idx;
@@ -1615,14 +1599,14 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Allocate a large sized memory block from the given heap
-        fn allocateLarge(heap: *Heap, size_init: usize) ?*align(SMALL_GRANULARITY) anyopaque {
+        inline fn allocateLarge(heap: *Heap, size_init: usize) ?*align(SMALL_GRANULARITY) anyopaque {
             var size = size_init;
 
             // Calculate number of needed max sized spans (including header)
-            // Since this function is never called if size > LARGE_SIZE_LIMIT
+            // Since this function is never called if size > calculateLargeSizeLimit(span_size.*)
             // the span_count is guaranteed to be <= LARGE_CLASS_COUNT
             size += SPAN_HEADER_SIZE;
-            var span_count: usize = std.math.shr(usize, size, span_size_shift.*);
+            var span_count: usize = size >> span_size_shift.*;
             if (size & (span_size.* - 1) != 0) {
                 span_count += 1;
             }
@@ -1640,7 +1624,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Allocate a huge block by mapping memory pages directly
-        fn allocateHuge(heap: *Heap, size_init: usize) ?*align(SMALL_GRANULARITY) anyopaque {
+        inline fn allocateHuge(heap: *Heap, size_init: usize) ?*align(SMALL_GRANULARITY) anyopaque {
             var size = size_init;
 
             heapCacheAdoptDeferred(heap, null);
@@ -1663,17 +1647,17 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Allocate a block of the given size
-        fn allocate(heap: *Heap, size: usize) ?*align(SMALL_GRANULARITY) anyopaque {
+        inline fn allocate(heap: *Heap, size: usize) ?*align(SMALL_GRANULARITY) anyopaque {
             if (size <= SMALL_SIZE_LIMIT) {
                 @setCold(false);
                 return allocateSmall(heap, size);
             }
-            if (size <= medium_size_limit) return allocateMedium(heap, size);
-            if (size <= LARGE_SIZE_LIMIT(span_size.*)) return allocateLarge(heap, size);
+            if (size <= medium_size_limit_runtime.*) return allocateMedium(heap, size);
+            if (size <= calculateLargeSizeLimit(span_size.*)) return allocateLarge(heap, size);
             return allocateHuge(heap, size);
         }
 
-        fn alignedAllocate(heap: *Heap, alignment: usize, size: usize) ?*align(SMALL_GRANULARITY) anyopaque {
+        inline fn alignedAllocate(heap: *Heap, alignment: usize, size: usize) ?*align(SMALL_GRANULARITY) anyopaque {
             if (alignment <= SMALL_GRANULARITY) {
                 if (size >= maxAllocSize()) return null;
                 return allocate(heap, size);
@@ -1686,7 +1670,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 return null;
             }
 
-            if ((alignment <= SPAN_HEADER_SIZE) and (size < medium_size_limit)) {
+            if ((alignment <= SPAN_HEADER_SIZE) and (size < medium_size_limit_runtime.*)) {
                 // If alignment is less or equal to span header size (which is power of two),
                 // and size aligned to span header size multiples is less than size + alignment,
                 // then use natural alignment of blocks to provide alignment
@@ -1762,10 +1746,10 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 }
 
                 if ((@ptrToInt(ptr) - @ptrToInt(span)) >= span_size.* or
-                    (@ptrToInt(pointerOffset(ptr, size)) > @ptrToInt(pointerOffset(span, mapped_size))) or
+                    (@ptrToInt(ptr) + size) > (@ptrToInt(span) + mapped_size) or
                     ((@ptrToInt(ptr) & span_mask.*) != @ptrToInt(span)))
                 {
-                    memoryUnmap(span, mapped_size, align_offset, mapped_size);
+                    memoryUnmap(span, align_offset, mapped_size);
                     num_pages += 1;
                     if (num_pages > limit_pages) {
                         if (true) unreachable;
@@ -1837,7 +1821,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             }
         }
 
-        fn deallocateDeferFreeSpan(heap: *Heap, span: *Span) void {
+        inline fn deallocateDeferFreeSpan(heap: *Heap, span: *Span) void {
             //This list does not need ABA protection, no mutable side state
             while (true) {
                 span.free_list = @ptrCast(?*anyopaque, atomicLoadPtr(&heap.span_free_deferred));
@@ -1846,7 +1830,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Put the block in the deferred free list of the owning span
-        fn deallocateDeferSmallOrMedium(span: *Span, block: *align(SMALL_GRANULARITY) anyopaque) void {
+        inline fn deallocateDeferSmallOrMedium(span: *Span, block: *align(SMALL_GRANULARITY) anyopaque) void {
             const free_list = blk: {
                 // TODO: is this OK? According to Protty `@atomicRmw` is already a loop like the one below
                 if (true) break :blk atomicExchangePtrAcquire(&span.free_list_deferred, INVALID_POINTER);
@@ -1876,17 +1860,19 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             }
         }
 
-        fn deallocateSmallOrMedium(span: *Span, p_init: *align(SMALL_GRANULARITY) anyopaque) void {
+        inline fn deallocateSmallOrMedium(span: *Span, p_init: *align(SMALL_GRANULARITY) anyopaque) void {
             var p = p_init;
             if (span.flags.aligned_blocks) {
                 // Realign pointer to block start
-                const blocks_start: *anyopaque = @ptrCast([*]u8, span) + SPAN_HEADER_SIZE;
+                const blocks_start: *align(SMALL_GRANULARITY) anyopaque = @ptrCast([*]align(SMALL_GRANULARITY) u8, span) + SPAN_HEADER_SIZE;
                 const block_offset = @ptrToInt(p) - @ptrToInt(blocks_start);
-                p = ptrAndAlignCast(*align(SMALL_GRANULARITY) anyopaque, @ptrCast([*]u8, p) - (block_offset % span.block_size));
+                const offset_mod_size = block_offset % span.block_size;
+                assert(offset_mod_size == 0); // TODO: this seems to be empirically true
+                p = ptrAndAlignCast(*align(SMALL_GRANULARITY) anyopaque, @ptrCast([*]u8, p) - offset_mod_size);
             }
 
             // Check if block belongs to this heap or if deallocation should be deferred
-            const defer_dealloc: bool = (span.heap.owner_thread != getThreadId()) and span.heap.finalize == 0;
+            const defer_dealloc: bool = span.heap.finalize == 0 and (span.heap.owner_thread != getThreadId());
             if (!defer_dealloc) {
                 deallocateDirectSmallOrMedium(span, p);
             } else {
@@ -1896,6 +1882,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
         /// Deallocate the given large memory block to the current heap
         fn deallocateLarge(span: *Span) void {
+            @setCold(true);
             assert(span.size_class == SIZE_CLASS_LARGE); // Bad span size class
             assert(!span.flags.master or !span.flags.subspan); // Span flag corrupted
             assert(span.flags.master or span.flags.subspan); // Span flag corrupted
@@ -1933,7 +1920,8 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Deallocate the given huge span
-        fn deallocateHuge(span: *Span) void {
+        inline fn deallocateHuge(span: *Span) void {
+            @setCold(true);
             const defer_dealloc: bool = (span.heap.owner_thread != getThreadId()) and span.heap.finalize == 0;
             if (defer_dealloc) {
                 deallocateDeferFreeSpan(span.heap, span);
@@ -1944,11 +1932,11 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
             // Oversized allocation, page count is stored in span_count
             const num_pages: usize = span.span_count;
-            memoryUnmap(span, num_pages * page_size, span.align_offset, num_pages * page_size);
+            memoryUnmap(span, span.align_offset, num_pages * page_size);
         }
 
         /// Deallocate the given block
-        fn deallocate(p_unaligned: *anyopaque) void {
+        inline fn deallocate(p_unaligned: *anyopaque) void {
             const p = @alignCast(SMALL_GRANULARITY, p_unaligned);
             // Grab the span (always at start of span, using span alignment)
             const span: *Span = @intToPtr(?*Span, @ptrToInt(p) & span_mask.*) orelse return;
@@ -1965,7 +1953,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         // Initialization, finalization and utility
 
         /// Get the usable size of the given block
-        fn usableSize(p: *anyopaque) usize {
+        inline fn usableSize(p: *anyopaque) usize {
             // Grab the span using guaranteed span alignment
             const span: *Span = @intToPtr(*Span, @ptrToInt(p) & span_mask.*);
             if (span.size_class < SIZE_CLASS_COUNT) {
@@ -1984,12 +1972,18 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Adjust and optimize the size class properties for the given class
-        fn adjustSizeClass(iclass: usize) void {
-            const block_size: usize = global_size_classes[iclass].block_size;
-            const block_count: usize = (span_size.* - SPAN_HEADER_SIZE) / block_size;
+        inline fn adjustSizeClass(
+            iclass: usize,
+            comptime size_classes: *[SIZE_CLASS_COUNT]SizeClass,
+            comptime input_span_size: *const @TypeOf(span_size.*),
+        ) void {
+            comptime assert(input_span_size == span_size);
 
-            global_size_classes[iclass].block_count = @intCast(u16, block_count);
-            global_size_classes[iclass].class_idx = @intCast(u16, iclass);
+            const block_size: usize = size_classes[iclass].block_size;
+            const block_count: usize = (input_span_size.* - SPAN_HEADER_SIZE) / block_size;
+
+            size_classes[iclass].block_count = @intCast(u16, block_count);
+            size_classes[iclass].class_idx = @intCast(u16, iclass);
 
             //Check if previous size classes can be merged
             if (iclass >= SMALL_CLASS_COUNT) {
@@ -1997,17 +1991,32 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 while (prevclass > 0) {
                     prevclass -= 1;
                     //A class can be merged if number of pages and number of blocks are equal
-                    if (global_size_classes[prevclass].block_count == global_size_classes[iclass].block_count) {
-                        global_size_classes[prevclass] = global_size_classes[iclass];
+                    if (size_classes[prevclass].block_count == size_classes[iclass].block_count) {
+                        size_classes[prevclass] = size_classes[iclass];
                     } else {
                         break;
                     }
                 }
             }
         }
+        /// Initializes the small size classes of the given array.
+        inline fn globalSmallSizeClassesInit(
+            comptime p_size_classes: *[SIZE_CLASS_COUNT]SizeClass,
+            comptime input_span_size: *const @TypeOf(span_size.*),
+        ) void {
+            comptime assert(input_span_size == span_size);
+            p_size_classes[0].block_size = SMALL_GRANULARITY;
+            adjustSizeClass(0, p_size_classes, input_span_size);
+            var iclass: usize = 1;
+            while (iclass < SMALL_CLASS_COUNT) : (iclass += 1) {
+                const size: usize = iclass * SMALL_GRANULARITY;
+                p_size_classes[iclass].block_size = @intCast(u32, size);
+                adjustSizeClass(iclass, p_size_classes, input_span_size);
+            }
+        }
 
         /// Initialize thread, assign heap
-        fn threadInitialize() void {
+        inline fn threadInitialize() void {
             const heap = heapAllocate() orelse return;
             setThreadHeap(heap);
             if (is_windows_and_not_dynamic) {
@@ -2016,7 +2025,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Finalize thread, orphan heap
-        fn threadFinalize(release_caches: bool) void {
+        inline fn threadFinalize(release_caches: bool) void {
             if (getThreadHeapRaw()) |heap| {
                 heapRelease(heap, release_caches);
                 setThreadHeap(null);
@@ -2031,18 +2040,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         pub const InitConfig = struct {
-            backing_allocator: ?if (known_allocator) noreturn else Allocator = null,
-            /// Called when a call to map memory pages fails (out of memory). If this callback is
-            /// not set or returns zero the library will return a null pointer in the allocation
-            /// call. If this callback returns non-zero the map call will be retried. The argument
-            /// passed is the number of bytes that was requested in the map call. Only used if
-            /// the default system memory map function is used (memory_map callback is not set).
-            mapFailCallback: *const fn (size: usize) bool = struct {
-                fn callback(_: usize) bool {
-                    @setCold(true);
-                    return false;
-                }
-            }.callback,
             /// Size of a span of memory blocks. MUST be a power of two, and in [4096,262144]
             /// range (unless 0 - set to 0 to use the default span size). Used if RPMALLOC_CONFIGURABLE
             /// is defined to 1.
@@ -2143,8 +2140,11 @@ const SIZE_CLASS_COUNT = (SMALL_CLASS_COUNT + MEDIUM_CLASS_COUNT);
 const LARGE_CLASS_COUNT = 63;
 /// Maximum size of a medium block
 const MEDIUM_SIZE_LIMIT = (SMALL_SIZE_LIMIT + (MEDIUM_GRANULARITY * MEDIUM_CLASS_COUNT));
+inline fn calculateMediumSizeLimitRuntime(input_span_size: anytype) @TypeOf(input_span_size) {
+    return @min(MEDIUM_SIZE_LIMIT, (input_span_size - SPAN_HEADER_SIZE) >> 1);
+}
 /// Maximum size of a large block
-inline fn LARGE_SIZE_LIMIT(span_size: anytype) @TypeOf(span_size) {
+inline fn calculateLargeSizeLimit(span_size: anytype) @TypeOf(span_size) {
     return ((LARGE_CLASS_COUNT * span_size) - SPAN_HEADER_SIZE);
 }
 /// Size of a span header (must be a multiple of SMALL_GRANULARITY and a power of two)
@@ -2177,21 +2177,6 @@ const SpanFlags = packed struct(u32) {
     _pad: enum(u28) { unset } = .unset,
 };
 
-fn DangerousCastAwayConst(comptime Original: type) type {
-    var new = @typeInfo(Original).Pointer;
-    new.is_const = false;
-    return @Type(.{ .Pointer = new });
-}
-inline fn dangerousCastAwayConst(ptr: anytype) DangerousCastAwayConst(@TypeOf(ptr)) {
-    const ConstPtr = @TypeOf(ptr);
-    const Reinterp = extern union {
-        with_const: ConstPtr,
-        without_const: DangerousCastAwayConst(ConstPtr),
-    };
-    const reinterp = Reinterp{ .with_const = ptr };
-    return reinterp.without_const;
-}
-
 // TODO: This is mainly just used in places where it makes things look neater,
 // but a lot of those are instances where the input type should probably already be aligned,
 // and the alignCast should happen further down the call stack.
@@ -2202,8 +2187,4 @@ inline fn ptrAndAlignCast(comptime T: type, ptr: anytype) T {
         else => unreachable,
     };
     return @ptrCast(T, @alignCast(alignment, ptr));
-}
-
-inline fn asOptional(val: anytype) ?@TypeOf(val) {
-    return val;
 }

@@ -7,7 +7,7 @@ const Rp = rpmalloc.RPMalloc(.{
 const allocator = Rp.allocator();
 
 export fn benchmark_initialize() c_int {
-    Rp.init(.{}) catch return -1;
+    Rp.init(null, .{}) catch return -1;
     return 0;
 }
 
