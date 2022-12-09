@@ -7,18 +7,21 @@ pub fn build(b: *std.build.Builder) void {
     const bench_implementation = b.option(enum { zig, c }, "impl", "Which impl of the benchmark to run") orelse .zig;
     const strip = b.option(bool, "strip", "Strip executable");
     const want_lto = b.option(bool, "want-lto", "Enable wanting LTO");
+    const single_threaded = b.option(bool, "single-threaded", "Disable threading");
 
     const zig_bench_impl_leo = b.addSharedLibrary("benchmark-impl-zig", "src/benchmark.zig", .unversioned);
     zig_bench_impl_leo.setBuildMode(mode);
     zig_bench_impl_leo.setTarget(target);
     zig_bench_impl_leo.strip = strip;
     zig_bench_impl_leo.want_lto = want_lto;
+    zig_bench_impl_leo.single_threaded = single_threaded;
 
     const c_bench_impl_leo = b.addSharedLibrary("benchmark-impl-c", null, .unversioned);
     c_bench_impl_leo.setBuildMode(mode);
     c_bench_impl_leo.setTarget(target);
     c_bench_impl_leo.strip = strip;
     c_bench_impl_leo.want_lto = want_lto;
+    c_bench_impl_leo.single_threaded = single_threaded;
     c_bench_impl_leo.addIncludePath("rpmalloc-benchmark/benchmark");
     c_bench_impl_leo.addIncludePath("rpmalloc-benchmark/test");
     c_bench_impl_leo.addCSourceFiles(&.{
@@ -34,6 +37,7 @@ pub fn build(b: *std.build.Builder) void {
     bench_leo.setTarget(target);
     bench_leo.strip = strip;
     bench_leo.want_lto = want_lto;
+    bench_leo.single_threaded = single_threaded;
 
     bench_leo.linkLibC();
     bench_leo.addIncludePath("rpmalloc-benchmark/benchmark");

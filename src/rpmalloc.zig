@@ -141,7 +141,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             threadInitialize(); // initialise this thread after everything else is set up.
         }
         pub inline fn initThread() error{}!void {
-            if (builtin.single_threaded) return;
+            comptime if (builtin.single_threaded) return;
             assert(getThreadId() != main_thread_id);
             assert(!isThreadInitialized());
             threadInitialize();
@@ -190,7 +190,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             initialized = false;
         }
         pub inline fn deinitThread(release_caches: bool) void {
-            if (builtin.single_threaded) return;
+            comptime if (builtin.single_threaded) return;
             assert(getThreadId() != main_thread_id);
             assert(isThreadInitialized());
             threadFinalize(release_caches);
@@ -323,7 +323,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         /// Control structure for a heap, either a thread heap or a first class heap if enabled
         const Heap = extern struct {
             /// Owning thread ID
-            owner_thread: std.Thread.Id,
+            owner_thread: if (builtin.single_threaded) [0]u8 else ThreadId,
             /// Free lists for each size class
             size_class: [SIZE_CLASS_COUNT]HeapSizeClass,
             /// Arrays of fully freed spans, single span
@@ -397,7 +397,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         var backing_allocator_mut: std.mem.Allocator = if (known_allocator) @compileError("Don't reference") else undefined;
 
         var initialized: bool = false;
-        var main_thread_id: if (builtin.single_threaded) u0 else std.Thread.Id = 0;
+        var main_thread_id: ThreadId = 0;
         const page_size: usize = std.mem.page_size;
         /// Shift to divide by page size
         const page_size_shift: std.math.Log2Int(usize) = std.math.log2_int(usize, page_size);
@@ -471,16 +471,19 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Fast thread ID
-        inline fn getThreadId() if (builtin.single_threaded) u0 else std.Thread.Id {
-            if (builtin.single_threaded) return 0;
+        const ThreadId = if (builtin.single_threaded) u0 else std.Thread.Id;
+        inline fn getThreadId() ThreadId {
+            comptime if (builtin.single_threaded) return 0;
             return std.Thread.getCurrentId();
         }
 
         /// Set the current thread heap
         inline fn setThreadHeap(heap: ?*Heap) void {
             thread_heap = heap;
-            if (heap) |h| {
-                h.owner_thread = getThreadId();
+            if (!builtin.single_threaded) {
+                if (heap) |h| {
+                    h.owner_thread = getThreadId();
+                }
             }
         }
 
@@ -1283,7 +1286,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
         inline fn heapInitialize(heap: *Heap) void {
             heap.* = comptime Heap{
-                .owner_thread = 0,
+                .owner_thread = if (builtin.single_threaded) undefined else 0,
                 .size_class = [_]HeapSizeClass{.{ .free_list = null, .partial_span = null, .cache = null }} ** SIZE_CLASS_COUNT,
                 .span_cache = if (enable_thread_cache) SpanCache{ .count = 0, .span = undefined } else .{},
                 .span_free_deferred = null,
@@ -1311,7 +1314,9 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         inline fn heapOrphan(heap: *Heap) void {
-            heap.owner_thread = std.math.maxInt(usize);
+            if (!builtin.single_threaded) {
+                heap.owner_thread = std.math.maxInt(usize);
+            }
             const heap_list: *?*Heap = &orphan_heaps;
             heap.next_orphan = heap_list.*;
             heap_list.* = heap;
@@ -1663,12 +1668,8 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 return allocate(heap, size);
             }
 
-            if ((size +% alignment) < size) {
-                return null;
-            }
-            if (alignment & (alignment - 1) != 0) {
-                return null;
-            }
+            assert((size +% alignment) < size);
+            assert(alignment & (alignment - 1) != 0);
 
             if ((alignment <= SPAN_HEADER_SIZE) and (size < medium_size_limit_runtime.*)) {
                 // If alignment is less or equal to span header size (which is power of two),
@@ -1776,7 +1777,9 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         /// Deallocate the given small/medium memory block in the current thread local heap
         fn deallocateDirectSmallOrMedium(span: *Span, block: *align(SMALL_GRANULARITY) anyopaque) void {
             const heap: *Heap = span.heap;
-            assert(heap.owner_thread == getThreadId() or heap.owner_thread == 0 or heap.finalize != 0); // Internal failure
+            if (!builtin.single_threaded) {
+                assert(heap.finalize != 0 or heap.owner_thread == 0 or heap.owner_thread == getThreadId()); // Internal failure
+            }
             // Add block to free list
             if (spanIsFullyUtilized(span)) {
                 span.used_count = span.block_count;
@@ -1822,7 +1825,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         inline fn deallocateDeferFreeSpan(heap: *Heap, span: *Span) void {
-            //This list does not need ABA protection, no mutable side state
+            // This list does not need ABA protection, no mutable side state
             while (true) {
                 span.free_list = @ptrCast(?*anyopaque, atomicLoadPtr(&heap.span_free_deferred));
                 if (atomicCasPtr(&heap.span_free_deferred, span, @ptrCast(?*Span, span.free_list))) break;
@@ -1872,7 +1875,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             }
 
             // Check if block belongs to this heap or if deallocation should be deferred
-            const defer_dealloc: bool = span.heap.finalize == 0 and (span.heap.owner_thread != getThreadId());
+            const defer_dealloc: bool = span.heap.finalize == 0 and (if (builtin.single_threaded) false else span.heap.owner_thread != getThreadId());
             if (!defer_dealloc) {
                 deallocateDirectSmallOrMedium(span, p);
             } else {
@@ -1881,13 +1884,13 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Deallocate the given large memory block to the current heap
-        fn deallocateLarge(span: *Span) void {
+        inline fn deallocateLarge(span: *Span) void {
             @setCold(true);
             assert(span.size_class == SIZE_CLASS_LARGE); // Bad span size class
             assert(!span.flags.master or !span.flags.subspan); // Span flag corrupted
             assert(span.flags.master or span.flags.subspan); // Span flag corrupted
             //We must always defer (unless finalizing) if from another heap since we cannot touch the list or counters of another heap
-            const defer_dealloc: bool = (span.heap.owner_thread != getThreadId()) and span.heap.finalize == 0;
+            const defer_dealloc: bool = span.heap.finalize == 0 and (if (builtin.single_threaded) false else span.heap.owner_thread != getThreadId());
 
             if (defer_dealloc) {
                 deallocateDeferFreeSpan(span.heap, span);
@@ -1922,7 +1925,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         /// Deallocate the given huge span
         inline fn deallocateHuge(span: *Span) void {
             @setCold(true);
-            const defer_dealloc: bool = (span.heap.owner_thread != getThreadId()) and span.heap.finalize == 0;
+            const defer_dealloc: bool = span.heap.finalize == 0 and (if (builtin.single_threaded) false else span.heap.owner_thread != getThreadId());
             if (defer_dealloc) {
                 deallocateDeferFreeSpan(span.heap, span);
                 return;
@@ -1939,7 +1942,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         inline fn deallocate(p_unaligned: *anyopaque) void {
             const p = @alignCast(SMALL_GRANULARITY, p_unaligned);
             // Grab the span (always at start of span, using span alignment)
-            const span: *Span = @intToPtr(?*Span, @ptrToInt(p) & span_mask.*) orelse return;
+            const span: *Span = @intToPtr(*Span, @ptrToInt(p) & span_mask.*);
             if (span.size_class < SIZE_CLASS_COUNT) {
                 @setCold(false);
                 deallocateSmallOrMedium(span, p);
