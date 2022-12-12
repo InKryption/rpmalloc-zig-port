@@ -8,15 +8,22 @@ pub fn build(b: *std.build.Builder) void {
     const strip = b.option(bool, "strip", "Strip executable");
     const want_lto = b.option(bool, "want-lto", "Enable wanting LTO");
     const single_threaded = b.option(bool, "single-threaded", "Disable threading");
+    const emit_asm = b.option(bool, "emit-asm", "Emit assembly");
+    const emit_asm_to = b.option([]const u8, "emit-asm-to", "Emit assembly");
+    std.debug.assert(
+        (emit_asm == null and emit_asm_to == null) or
+            (emit_asm != null) != (emit_asm_to != null),
+    );
 
-    const zig_bench_impl_leo = b.addSharedLibrary("benchmark-impl-zig", "src/benchmark.zig", .unversioned);
+    const zig_bench_impl_leo = b.addStaticLibrary("benchmark-impl-zig", "src/benchmark.zig");
     zig_bench_impl_leo.setBuildMode(mode);
     zig_bench_impl_leo.setTarget(target);
     zig_bench_impl_leo.strip = strip;
     zig_bench_impl_leo.want_lto = want_lto;
     zig_bench_impl_leo.single_threaded = single_threaded;
+    zig_bench_impl_leo.emit_asm = if (emit_asm) |cond| (if (cond) .emit else .no_emit) else if (emit_asm_to) |path| .{ .emit_to = path } else .default;
 
-    const c_bench_impl_leo = b.addSharedLibrary("benchmark-impl-c", null, .unversioned);
+    const c_bench_impl_leo = b.addStaticLibrary("benchmark-impl-c", null);
     c_bench_impl_leo.setBuildMode(mode);
     c_bench_impl_leo.setTarget(target);
     c_bench_impl_leo.strip = strip;

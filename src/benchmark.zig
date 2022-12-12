@@ -1,9 +1,7 @@
 const std = @import("std");
 const rpmalloc = @import("rpmalloc.zig");
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-const Rp = rpmalloc.RPMalloc(.{
-    // .enable_global_cache = true,
-});
+const Rp = rpmalloc.RPMalloc(.{});
 const allocator = Rp.allocator();
 
 export fn benchmark_initialize() c_int {
