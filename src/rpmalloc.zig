@@ -914,7 +914,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 insert_count = cache_limit - cache.count;
 
             // memcpy(cache->span + cache->count, span, sizeof(Span*) * insert_count);
-            for (cache.span[cache.count..][0..insert_count]) |*dst, i| {
+            for ((@as([*]*Span, &cache.span) + cache.count)[0..insert_count]) |*dst, i| {
                 dst.* = span[i];
             }
             cache.count += @intCast(u32, insert_count);
@@ -989,8 +989,8 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             const want = @intCast(u32, @min(count - extract_count, cache.count));
 
             // memcpy(span + extract_count, cache->span + (cache->count - want), sizeof(span_t*) * want);
-            for ((span + extract_count)[0..want]) |*dst, i| {
-                dst.* = @as([*]*Span, &cache.span)[cache.count - want .. want][i];
+            for (@as([*]*Span, &cache.span)[cache.count - want .. want][0..want]) |src, i| {
+                (span + extract_count)[i] = src;
             }
 
             cache.count -= want;
@@ -1065,12 +1065,12 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 }
             } else {
                 if (atomicDecr32(&heap.master_heap.?.child_count) == 0) {
-                    heapUnmap(heap.master_heap.?);
+                    return @call(.{ .modifier = .always_tail }, heapUnmap, .{heap.master_heap.?});
                 }
             }
         }
 
-        fn heapGlobalFinalize(heap: *Heap) void {
+        inline fn heapGlobalFinalize(heap: *Heap) void {
             if (heap.finalize > 1) return;
             heap.finalize += 1;
 
@@ -1138,7 +1138,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     if (span_cache.count == MAX_THREAD_SPAN_CACHE) {
                         const remain_count: usize = MAX_THREAD_SPAN_CACHE - THREAD_SPAN_CACHE_TRANSFER;
                         if (enable_global_cache) {
-                            globalCacheInsertSpans(span_cache.span[remain_count..], span_count, THREAD_SPAN_CACHE_TRANSFER);
+                            globalCacheInsertSpans(@as([*]*Span, &span_cache.span) + remain_count, span_count, THREAD_SPAN_CACHE_TRANSFER);
                         } else {
                             var ispan: usize = 0;
                             while (ispan < THREAD_SPAN_CACHE_TRANSFER) : (ispan += 1) {
@@ -1159,7 +1159,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                         const transfer_count: usize = if (THREAD_SPAN_LARGE_CACHE_TRANSFER <= transfer_limit) THREAD_SPAN_LARGE_CACHE_TRANSFER else transfer_limit;
                         const remain_count: usize = cache_limit - transfer_count;
                         if (enable_global_cache) {
-                            globalCacheInsertSpans(span_cache.span[remain_count..].ptr, span_count, transfer_count);
+                            globalCacheInsertSpans(@as([*]*Span, &span_cache.span) + remain_count, span_count, transfer_count);
                         } else {
                             var ispan: usize = 0;
                             while (ispan < transfer_count) : (ispan += 1) {
@@ -1223,7 +1223,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                         span_cache = @ptrCast(*SpanCache, &heap.span_large_cache[span_count - 2]);
                         wanted_count = THREAD_SPAN_LARGE_CACHE_TRANSFER;
                     }
-                    span_cache.count = globalCacheExtractSpans(span_cache.span[0..], span_count, wanted_count);
+                    span_cache.count = globalCacheExtractSpans(&span_cache.span, span_count, wanted_count);
                     if (span_cache.count != 0) {
                         span_cache.count -= 1;
                         return span_cache.span[span_cache.count];
@@ -1240,7 +1240,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Get a span from one of the cache levels (thread cache, reserved, global cache) or fallback to mapping more memory
-        fn heapExtractNewSpan(heap: *Heap, maybe_heap_size_class: ?*HeapSizeClass, span_count_init: usize) ?*Span {
+        inline fn heapExtractNewSpan(heap: *Heap, maybe_heap_size_class: ?*HeapSizeClass, span_count_init: usize) ?*Span {
             if (enable_thread_cache) cached_blk: {
                 const heap_size_class: *HeapSizeClass = maybe_heap_size_class orelse break :cached_blk;
                 const span: *Span = heap_size_class.cache orelse break :cached_blk;
@@ -1428,7 +1428,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                                         spanUnmap(span_cache.span[ispan]);
                                     }
                                 } else {
-                                    globalCacheInsertSpans(span_cache.span[0..], iclass + 1, span_cache.count);
+                                    globalCacheInsertSpans(&span_cache.span, iclass + 1, span_cache.count);
                                 }
                             } else {
                                 var ispan: usize = 0;
