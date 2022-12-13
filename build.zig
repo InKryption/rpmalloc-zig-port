@@ -24,22 +24,22 @@ pub fn build(b: *std.build.Builder) void {
     zig_bench_impl_leo.emit_asm = if (emit_asm) |cond| (if (cond) .emit else .no_emit) else if (emit_asm_to) |path| .{ .emit_to = path } else .default;
     zig_bench_impl_leo.addPackagePath("rpmalloc", "src/rpmalloc.zig");
 
-    const c_bench_impl_leo = b.addStaticLibrary("benchmark-impl-c", "rpmalloc-benchmark/benchmark/rpmalloc/benchmark.c");
+    const c_bench_impl_leo = b.addStaticLibrary("benchmark-impl-c", "benchmark/rpmalloc-benchmark/benchmark/rpmalloc/benchmark.c");
     c_bench_impl_leo.setBuildMode(mode);
     c_bench_impl_leo.setTarget(target);
     c_bench_impl_leo.strip = strip;
     c_bench_impl_leo.want_lto = want_lto;
     c_bench_impl_leo.single_threaded = single_threaded;
-    c_bench_impl_leo.addIncludePath("rpmalloc-benchmark/benchmark");
-    c_bench_impl_leo.addIncludePath("rpmalloc-benchmark/test");
+    c_bench_impl_leo.addIncludePath("benchmark/rpmalloc-benchmark/benchmark");
+    c_bench_impl_leo.addIncludePath("benchmark/rpmalloc-benchmark/test");
     c_bench_impl_leo.addCSourceFiles(&.{
-        "rpmalloc-benchmark/benchmark/rpmalloc/rpmalloc.c",
+        "benchmark/rpmalloc-benchmark/benchmark/rpmalloc/rpmalloc.c",
     }, &.{"-O3"});
     c_bench_impl_leo.linkLibC();
 
     const bench_leo = b.addExecutable(switch (bench_implementation) {
         inline else => |tag| "benchmark-" ++ @tagName(tag),
-    }, "rpmalloc-benchmark/benchmark/main.c");
+    }, "benchmark/rpmalloc-benchmark/benchmark/main.c");
     bench_leo.setBuildMode(mode);
     bench_leo.setTarget(target);
     bench_leo.strip = strip;
@@ -47,11 +47,11 @@ pub fn build(b: *std.build.Builder) void {
     bench_leo.single_threaded = single_threaded;
 
     bench_leo.linkLibC();
-    bench_leo.addIncludePath("rpmalloc-benchmark/benchmark");
-    bench_leo.addIncludePath("rpmalloc-benchmark/test");
+    bench_leo.addIncludePath("benchmark/rpmalloc-benchmark/benchmark");
+    bench_leo.addIncludePath("benchmark/rpmalloc-benchmark/test");
     bench_leo.addCSourceFiles(&.{
-        "rpmalloc-benchmark/test/thread.c",
-        "rpmalloc-benchmark/test/timer.c",
+        "benchmark/rpmalloc-benchmark/test/thread.c",
+        "benchmark/rpmalloc-benchmark/test/timer.c",
     }, &.{"-O3"});
 
     switch (bench_implementation) {
