@@ -32,5 +32,5 @@ Although it should be clear from the example, I'll note that this allocator is i
 
 ## Notes
 * There are a good few TODO comments in the code, comprised mostly of uncertanties on as to the benefits or semantics of certain parts of the code.
-* At the time of writing, the port runs marginally slower than the original C source in the benchmark when linked statically, and a bit more notably when linked dynamically.
+* At the time of writing, the port runs marginally slower than the original C source in the benchmark when linked statically, and notably slower when linked dynamically.
 * I've opted to remove most code related to partial unmapping, as it's not a pattern that is well-suited to Zig (or at least that I couldn't figure out how to map to Zig's prototypical allocator patterns).
