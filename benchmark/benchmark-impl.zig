@@ -1,5 +1,5 @@
 const std = @import("std");
-const rpmalloc = @import("rpmalloc.zig");
+const rpmalloc = @import("rpmalloc");
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 const Rp = rpmalloc.RPMalloc(.{});
 const allocator = Rp.allocator();

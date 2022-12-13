@@ -15,15 +15,16 @@ pub fn build(b: *std.build.Builder) void {
             (emit_asm != null) != (emit_asm_to != null),
     );
 
-    const zig_bench_impl_leo = b.addStaticLibrary("benchmark-impl-zig", "src/benchmark.zig");
+    const zig_bench_impl_leo = b.addStaticLibrary("benchmark-impl-zig", "benchmark/benchmark-impl.zig");
     zig_bench_impl_leo.setBuildMode(mode);
     zig_bench_impl_leo.setTarget(target);
     zig_bench_impl_leo.strip = strip;
     zig_bench_impl_leo.want_lto = want_lto;
     zig_bench_impl_leo.single_threaded = single_threaded;
     zig_bench_impl_leo.emit_asm = if (emit_asm) |cond| (if (cond) .emit else .no_emit) else if (emit_asm_to) |path| .{ .emit_to = path } else .default;
+    zig_bench_impl_leo.addPackagePath("rpmalloc", "src/rpmalloc.zig");
 
-    const c_bench_impl_leo = b.addStaticLibrary("benchmark-impl-c", null);
+    const c_bench_impl_leo = b.addStaticLibrary("benchmark-impl-c", "rpmalloc-benchmark/benchmark/rpmalloc/benchmark.c");
     c_bench_impl_leo.setBuildMode(mode);
     c_bench_impl_leo.setTarget(target);
     c_bench_impl_leo.strip = strip;
@@ -32,7 +33,6 @@ pub fn build(b: *std.build.Builder) void {
     c_bench_impl_leo.addIncludePath("rpmalloc-benchmark/benchmark");
     c_bench_impl_leo.addIncludePath("rpmalloc-benchmark/test");
     c_bench_impl_leo.addCSourceFiles(&.{
-        "rpmalloc-benchmark/benchmark/rpmalloc/benchmark.c",
         "rpmalloc-benchmark/benchmark/rpmalloc/rpmalloc.c",
     }, &.{"-O3"});
     c_bench_impl_leo.linkLibC();
