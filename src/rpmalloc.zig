@@ -694,9 +694,8 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     }
                 }
             }
-            defer if (use_global_reserve) {
-                releaseLock(&global_lock);
-            };
+            defer if (use_global_reserve) releaseLock(&global_lock);
+
             if (span == null) {
                 span = spanMapAlignedCount(heap, span_count);
             }
@@ -786,12 +785,12 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             span.size_class = class_idx;
             span.heap = heap;
             // span.flags &= ~SPAN_FLAG_ALIGNED_BLOCKS;
-            span.flags = SpanFlags{
-                .master = span.flags.master,
-                .subspan = span.flags.subspan,
+            @ptrCast(*SpanFlags.BackingInt, &span.flags).* &= comptime @bitCast(u32, SpanFlags{
+                .master = true,
+                .subspan = true,
                 .aligned_blocks = false,
-                .unmapped_master = span.flags.unmapped_master,
-            };
+                .unmapped_master = true,
+            });
             span.block_size = size_class.block_size;
             span.block_count = size_class.block_count;
             span.free_list = null;
@@ -864,7 +863,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 heap.size_class[iclass].free_list = null;
                 span.used_count -= free_count;
             }
-            // TODO: should this leak check be kept? And should it be an assertion?
+            // TODO: Figure out the situation here
             assert(span.list_size == span.used_count); // If this assert triggers you have memory leaks
             // if (span.list_size == span.used_count) {
             if (true) {
@@ -887,14 +886,8 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             acquireLock(&cache.lock);
             defer releaseLock(&cache.lock);
 
-            {
-                // var i: u32 = 0;
-                // while (i < cache.count) : (i += 1) {
-                //     spanUnmap(@as([*]*Span, &cache.span)[i]);
-                // }
-                for (@as([*]*Span, &cache.span)[0..cache.count]) |span| {
-                    spanUnmap(span);
-                }
+            for (@as([*]*Span, &cache.span)[0..cache.count]) |span| {
+                spanUnmap(span);
             }
             cache.count = 0;
 
@@ -915,32 +908,34 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             const cache: *GlobalCache = &global_span_cache[span_count - 1];
 
             var insert_count: usize = count;
-            acquireLock(&cache.lock);
+            {
+                acquireLock(&cache.lock);
+                defer releaseLock(&cache.lock);
 
-            if ((cache.count + insert_count) > cache_limit)
-                insert_count = cache_limit - cache.count;
+                if ((cache.count + insert_count) > cache_limit)
+                    insert_count = cache_limit - cache.count;
 
-            // memcpy(cache->span + cache->count, span, sizeof(Span*) * insert_count);
-            for ((@as([*]*Span, &cache.span) + cache.count)[0..insert_count]) |*dst, i| {
-                dst.* = span[i];
+                // memcpy(cache->span + cache->count, span, sizeof(Span*) * insert_count);
+                for ((@as([*]*Span, &cache.span) + cache.count)[0..insert_count]) |*dst, i| {
+                    dst.* = span[i];
+                }
+                cache.count += @intCast(u32, insert_count);
+
+                while ( // zig fmt: off
+                    if (comptime enable_unlimited_cache)
+                        (insert_count < count)
+                    else
+                        // Enable unlimited cache if huge pages, or we will leak since it is unlikely that an entire huge page
+                        // will be unmapped, and we're unable to partially decommit a huge page
+                        ((page_size > span_size.*) and (insert_count < count))
+                    // zig fmt: on
+                ) {
+                    const current_span: *Span = span[insert_count];
+                    insert_count += 1;
+                    current_span.next = cache.overflow;
+                    cache.overflow = current_span;
+                }
             }
-            cache.count += @intCast(u32, insert_count);
-
-            while ( // zig fmt: off
-                if (comptime enable_unlimited_cache)
-                    (insert_count < count)
-                else
-                    // Enable unlimited cache if huge pages, or we will leak since it is unlikely that an entire huge page
-                    // will be unmapped, and we're unable to partially decommit a huge page
-                    ((page_size > span_size.*) and (insert_count < count))
-                // zig fmt: on
-            ) {
-                const current_span: *Span = span[insert_count];
-                insert_count += 1;
-                current_span.next = cache.overflow;
-                cache.overflow = current_span;
-            }
-            releaseLock(&cache.lock);
 
             var keep: ?*Span = null;
             for (span[insert_count..count]) |current_span| {
@@ -1236,7 +1231,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                         return span_cache.span[span_cache.count];
                     }
                 } else {
-                    var span: ?*Span = null;
+                    var span: *Span = undefined;
                     const count: usize = globalCacheExtractSpans(@ptrCast(*[1]*Span, &span), span_count, 1);
                     if (count != 0) {
                         return span;
@@ -1368,15 +1363,12 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 break :span_init span;
             };
 
-            var remain_size: usize = span_size.* - @sizeOf(Span);
+            const remain_size: usize = span_size.* - @sizeOf(Span);
             const heap: *Heap = @ptrCast(*Heap, @ptrCast([*]Span, span) + 1);
             heapInitialize(heap);
 
             // Put extra heaps as orphans
-            var num_heaps: usize = remain_size / aligned_heap_size;
-            if (num_heaps < request_heap_count) {
-                num_heaps = request_heap_count;
-            }
+            var num_heaps: usize = @max(remain_size / aligned_heap_size, request_heap_count);
             @atomicStore(u32, &heap.child_count, @intCast(u32, num_heaps - 1), .Monotonic);
             var extra_heap: *Heap = @ptrCast(*Heap, @ptrCast([*]align(@alignOf(Heap)) u8, heap) + aligned_heap_size);
             while (num_heaps > 1) {
@@ -1735,7 +1727,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             // }
             const limit_pages: usize = 2 * @max(span_size.* / page_size, original_pages);
 
-            var ptr: ?*align(SMALL_GRANULARITY) anyopaque = null;
+            var ptr: *align(SMALL_GRANULARITY) anyopaque = undefined;
             var mapped_size: usize = undefined;
             var align_offset: usize = undefined;
             var span: *Span = undefined;
@@ -1757,10 +1749,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 {
                     memoryUnmap(span, align_offset, mapped_size);
                     num_pages += 1;
-                    if (num_pages > limit_pages) {
-                        if (true) unreachable;
-                        return null;
-                    }
+                    if (num_pages > limit_pages) return null;
                     continue :retry;
                 }
 
@@ -2149,6 +2138,7 @@ comptime {
 }
 
 const SpanFlags = packed struct(u32) {
+    const BackingInt = @typeInfo(SpanFlags).Struct.backing_integer.?;
     /// Flag indicating span is the first (master) span of a split superspan
     master: bool = false,
     /// Flag indicating span is a secondary (sub) span of a split superspan
