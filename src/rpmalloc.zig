@@ -7,18 +7,20 @@ pub const RPMallocOptions = struct {
     /// Enable configuring sizes at runtime. Will introduce a very small
     /// overhead due to some size calculations not being compile time constants
     configurable_sizes: bool = false,
-    /// Size of heap hashmap
-    heap_array_size: usize = 47,
     /// Enable per-thread cache
     enable_thread_cache: bool = true,
     /// Enable global cache shared between all threads, requires thread cache
     enable_global_cache: bool = true,
+    /// Enable some slightly more expensive safety checks.
+    enable_asserts: bool = std.debug.runtime_safety,
     /// Disable unmapping memory pages (also enables unlimited cache)
     disable_unmap: bool = false,
     /// Enable unlimited global cache (no unmapping until finalization)
     enable_unlimited_cache: bool = false,
     /// Default number of spans to map in call to map more virtual memory (default values yield 4MiB here)
     default_span_map_count: usize = 64,
+    /// Size of heap hashmap
+    heap_array_size: usize = 47,
     /// Multiplier for global cache
     global_cache_multiplier: usize = 8,
     /// Either a pointer to a comptime-known pointer to an allocator interface, or null to indicate
@@ -206,7 +208,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 len,
             ) orelse return null;
 
-            if (std.debug.runtime_safety) {
+            if (options.enable_asserts) {
                 const usable_size = usableSize(result_ptr);
                 assert(len <= usable_size);
             }
@@ -218,7 +220,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
             const usable_size = usableSize(buf.ptr);
             assert(buf.len <= usable_size);
-            if (std.debug.runtime_safety) {
+            if (options.enable_asserts) {
                 assert(std.mem.isAligned(@ptrToInt(buf.ptr), std.math.shl(usize, 1, buf_align)));
             }
 
@@ -227,7 +229,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         fn free(state_ptr: *anyopaque, buf: []u8, buf_align: u8, ret_addr: usize) void {
             _ = state_ptr;
             _ = ret_addr;
-            if (std.debug.runtime_safety) {
+            if (options.enable_asserts) {
                 const usable_size = usableSize(buf.ptr);
                 assert(buf.len <= usable_size);
                 assert(std.mem.isAligned(@ptrToInt(buf.ptr), std.math.shl(usize, 1, buf_align)));
@@ -652,7 +654,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 // then the assumed precondition of this branch would indicate that it is never allowed to happen anyways.
                 if (false) if (reserved_count > heap_reserve_count) {
                     // If huge pages or eager spam map count, the global reserve spin lock is held by caller, spanMap
-                    if (std.debug.runtime_safety) {
+                    if (options.enable_asserts) {
                         assert(@atomicLoad(u32, &global_lock, .Monotonic) == 1); // Global spin lock not held as expected
                     }
                     const remain_count: usize = reserved_count - heap_reserve_count;
@@ -729,12 +731,12 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             } else {
                 // Special double flag to denote an unmapped master
                 // It must be kept in memory since span header must be used
-                span.flags = .{
-                    .aligned_blocks = span.flags.aligned_blocks,
+                @ptrCast(*SpanFlags.BackingInt, &span.flags).* |= comptime @bitCast(SpanFlags.BackingInt, SpanFlags{
+                    .aligned_blocks = false,
                     .master = true,
                     .subspan = true,
                     .unmapped_master = true,
-                };
+                });
             }
 
             std.debug.assert(span.span_count != 0);
@@ -867,11 +869,11 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             assert(span.list_size == span.used_count); // If this assert triggers you have memory leaks
             // if (span.list_size == span.used_count) {
             if (true) {
-                // This function only used for spans in double linked lists
-                if (list_head != null) {
-                    spanDoubleLinkListRemove(list_head.?, span);
-                }
-                spanUnmap(span);
+            // This function only used for spans in double linked lists
+            if (list_head != null) {
+                spanDoubleLinkListRemove(list_head.?, span);
+            }
+            spanUnmap(span);
                 return true;
             }
             return false;
@@ -1005,7 +1007,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 cache.overflow = current_span.next;
             }
 
-            if (std.debug.runtime_safety) {
+            if (options.enable_asserts) {
                 for (span[0..extract_count]) |span_elem| {
                     assert(span_elem.span_count == span_count);
                 }
@@ -1507,7 +1509,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     span_cache.count = 0;
                 }
             }
-            if (std.debug.runtime_safety) {
+            if (options.enable_asserts) {
                 assert(@atomicLoad(?*Span, &heap.span_free_deferred, .Monotonic) == null); // Heaps still active during finalization
             }
         }
@@ -1666,7 +1668,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 return allocate(heap, size);
             }
 
-            if (std.debug.runtime_safety) {
+            if (options.enable_asserts) {
                 assert((size +% alignment) < size);
                 assert(alignment & (alignment - 1) != 0);
             }
@@ -1676,7 +1678,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 // and size aligned to span header size multiples is less than size + alignment,
                 // then use natural alignment of blocks to provide alignment
                 const multiple_size: usize = if (size != 0) (size + (SPAN_HEADER_SIZE - 1)) & ~@as(usize, SPAN_HEADER_SIZE - 1) else SPAN_HEADER_SIZE;
-                if (std.debug.runtime_safety) {
+                if (options.enable_asserts) {
                     assert(multiple_size % SPAN_HEADER_SIZE == 0); // Failed alignment calculation
                 }
                 if (multiple_size <= (size + alignment)) {
@@ -1706,7 +1708,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             // or greater, since the span header will push alignment more than one
             // span size away from span start (thus causing pointer mask to give us
             // an invalid span start on free)
-            if (std.debug.runtime_safety) {
+            if (options.enable_asserts) {
                 assert(alignment & align_mask == 0);
                 assert(alignment < span_size.*);
             }
@@ -1908,7 +1910,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     const master = ptrAndAlignCast(*Span, @ptrCast([*]u8, span) - (span.offset_from_master * span_size.*));
                     heap.span_reserve_master = master;
                     assert(master.flags.master); // Span flag corrupted
-                    if (std.debug.runtime_safety) {
+                    if (options.enable_asserts) {
                         assert(@atomicLoad(u32, &master.remaining_spans, .Monotonic) >= span.span_count); // Master span count corrupted
                     }
                 }
@@ -2151,9 +2153,6 @@ const SpanFlags = packed struct(u32) {
     _pad: enum(u28) { unset } = .unset,
 };
 
-// TODO: This is mainly just used in places where it makes things look neater,
-// but a lot of those are instances where the input type should probably already be aligned,
-// and the alignCast should happen further down the call stack.
 inline fn ptrAndAlignCast(comptime T: type, ptr: anytype) T {
     const alignment = comptime switch (@typeInfo(T)) {
         .Pointer => |pointer| pointer.alignment,
