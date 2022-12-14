@@ -844,7 +844,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             if (span == class_span) {
                 // Adopt the heap class free list back into the span free list
                 var block: ?*align(SMALL_GRANULARITY) anyopaque = span.free_list;
-                var last_block: @TypeOf(block) = null;
+                var last_block: @TypeOf(block) = undefined;
                 while (block != null) {
                     last_block = block;
                     block = @ptrCast(*@TypeOf(block), block).*;
@@ -1528,7 +1528,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 assert(heap_size_class.partial_span.?.block_count == global_size_classes[heap_size_class.partial_span.?.size_class].block_count); // Span block count corrupted
                 assert(!spanIsFullyUtilized(heap_size_class.partial_span.?)); // Internal failure
                 const block: *align(SMALL_GRANULARITY) anyopaque = block: {
-                    var block: ?*align(SMALL_GRANULARITY) anyopaque = null;
+                    var block: ?*align(SMALL_GRANULARITY) anyopaque = undefined; // this undefined is safe, (so long as) `freeListPartialInit` only writes to it.
                     if (heap_size_class.partial_span.?.free_list != null) {
                         //Span local free list is not empty, swap to size class free list
                         block = freeListPop(&heap_size_class.partial_span.?.free_list);
