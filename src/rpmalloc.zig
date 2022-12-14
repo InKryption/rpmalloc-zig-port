@@ -1,10 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-// const assert = std.debug.assert;
-inline fn assert(cond: bool) void {
-    if (!cond) unreachable;
-}
+const assert = std.debug.assert;
 
 pub const RPMallocOptions = struct {
     /// Enable configuring sizes at runtime. Will introduce a very small
@@ -156,12 +153,12 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             threadFinalize(true);
 
             if (global_reserve != null) {
-                _ = atomicAdd32(&global_reserve_master.?.remaining_spans, -@intCast(i32, global_reserve_count));
+                _ = @atomicRmw(u32, &global_reserve_master.?.remaining_spans, .Sub, @intCast(u32, global_reserve_count), .Monotonic);
                 global_reserve_master = null;
                 global_reserve_count = 0;
                 global_reserve = null;
             }
-            releaseLock(&global_lock);
+            releaseLock(&global_lock); // this is just to set the lock back to its initial state
 
             { // Free all thread caches and fully free spans
                 var list_idx: usize = 0;
@@ -222,7 +219,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             const usable_size = usableSize(buf.ptr);
             assert(buf.len <= usable_size);
             if (std.debug.runtime_safety) {
-                assert(buf.len <= usable_size);
                 assert(std.mem.isAligned(@ptrToInt(buf.ptr), std.math.shl(usize, 1, buf_align)));
             }
 
@@ -280,7 +276,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             /// Offset from master span for subspans
             offset_from_master: u32,
             /// Remaining span counter, for master spans
-            remaining_spans: i32, // atomic
+            remaining_spans: u32, // atomic
             /// Alignment offset
             align_offset: u32,
             /// Owning heap
@@ -334,13 +330,13 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             /// Number of mapped but unused spans
             spans_reserved: u32,
             /// Child count
-            child_count: i32, // atomic
+            child_count: u32, // atomic
             /// Next heap in id list
             next_heap: ?*Heap,
             /// Next heap in orphan list
             next_orphan: ?*Heap,
             /// Heap ID
-            id: i32,
+            id: u32,
             /// Finalization state flag
             finalize: i8,
             /// Master heap owning the memory pages
@@ -366,7 +362,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
         const GlobalCache = extern struct {
             /// Cache lock
-            lock: i32, // atomic
+            lock: u32, // atomic
             /// Cache count
             count: u32,
             /// Cached spans
@@ -433,7 +429,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         const medium_size_limit_runtime: ConfigurableIntPtr(usize) = if (!configurable_sizes) &calculateMediumSizeLimitRuntime(span_size.*) else &medium_size_limit_runtime_mut;
         var medium_size_limit_runtime_mut: usize = if (configurable_sizes) undefined else @compileError("Don't reference");
 
-        var heap_id_counter: i32 = 0; // atomic
+        var heap_id_counter: u32 = 0; // atomic
 
         var global_span_cache = if (enable_global_cache) ([_]GlobalCache{.{
             .lock = 0,
@@ -449,7 +445,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         // TODO: Is this comment accurate? If so, does that mean that
         // this isn't needed if we're not supporting huge pages?
         /// Used to restrict access to mapping memory for huge pages
-        var global_lock: atomic32_t = 0; // atomic
+        var global_lock: u32 = 0; // atomic
         /// Orphaned heaps
         var orphan_heaps: ?*Heap = null;
 
@@ -631,7 +627,10 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             span.align_offset = @intCast(u32, align_offset);
             span.flags = .{ .master = true };
             assert(@bitCast(u32, span.flags) == 1);
-            atomicStore32(&span.remaining_spans, @intCast(i32, total_span_count));
+            // TODO: Is there a reason for this to be atomic?
+            // Intuitively it seems like there wouldn't be, since the span in question has presumably
+            // just been mapped, and thus wouldn't be accessible by any other thread at present.
+            @atomicStore(u32, &span.remaining_spans, @intCast(u32, total_span_count), .Monotonic);
         }
 
         /// Map an aligned set of spans, taking configured mapping granularity and the page size into account
@@ -653,7 +652,9 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 // then the assumed precondition of this branch would indicate that it is never allowed to happen anyways.
                 if (false) if (reserved_count > heap_reserve_count) {
                     // If huge pages or eager spam map count, the global reserve spin lock is held by caller, spanMap
-                    assert(atomicLoad32(&global_lock) == 1); // Global spin lock not held as expected
+                    if (std.debug.runtime_safety) {
+                        assert(@atomicLoad(u32, &global_lock, .Monotonic) == 1); // Global spin lock not held as expected
+                    }
                     const remain_count: usize = reserved_count - heap_reserve_count;
                     reserved_count = heap_reserve_count;
                     const remain_span: *Span = ptrAndAlignCast(*Span, @ptrCast([*]u8, reserved_spans) + (reserved_count * span_size.*));
@@ -715,7 +716,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             assert(is_master or span.flags.subspan); // Span flag corrupted
             assert(master.flags.master); // Span flag corrupted
 
-            const span_count: usize = span.span_count;
             if (!is_master) {
                 assert(span.align_offset == 0); // Span align offset corrupted
 
@@ -738,7 +738,9 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 };
             }
 
-            if (atomicAdd32(&master.remaining_spans, -@intCast(i32, span_count)) <= 0) {
+            std.debug.assert(span.span_count != 0);
+            const prev_remaining_spans = @atomicRmw(u32, &master.remaining_spans, .Sub, span.span_count, .Monotonic);
+            if (prev_remaining_spans -% span.span_count >= prev_remaining_spans) {
                 // Everything unmapped, unmap the master span with release flag to unmap the entire range of the super span
                 assert(master.flags.master and master.flags.subspan); // Span flag corrupted
                 memoryUnmap(master, master.align_offset, @as(usize, master.total_spans) * span_size.*);
@@ -943,7 +945,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             var keep: ?*Span = null;
             for (span[insert_count..count]) |current_span| {
                 // Keep master spans that has remaining subspans to avoid dangling them
-                if (current_span.flags.master and (atomicLoad32(&current_span.remaining_spans) > current_span.span_count)) {
+                if (current_span.flags.master and (@atomicLoad(u32, &current_span.remaining_spans, .Monotonic) > current_span.span_count)) {
                     current_span.next = keep;
                     keep = current_span;
                 } else {
@@ -960,7 +962,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     while (islot < cache.count) : (islot += 1) {
                         const current_span: *Span = cache.span[islot];
                         if (!current_span.flags.master or
-                            (current_span.flags.master and (atomicLoad32(&current_span.remaining_spans) <= current_span.span_count)))
+                            (current_span.flags.master and (@atomicLoad(u32, &current_span.remaining_spans, .Monotonic) <= current_span.span_count)))
                         {
                             spanUnmap(current_span);
                             cache.span[islot] = keep.?;
@@ -1064,12 +1066,12 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
         fn heapUnmap(heap: *Heap) void {
             if (heap.master_heap == null) {
-                if ((heap.finalize > 1) and atomicLoad32(&heap.child_count) == 0) {
+                if ((heap.finalize > 1) and @atomicLoad(u32, &heap.child_count, .Monotonic) == 0) {
                     const span: *Span = getSpanPtr(heap).?;
                     spanUnmap(span);
                 }
             } else {
-                if (atomicDecr32(&heap.master_heap.?.child_count) == 0) {
+                if (@atomicRmw(u32, &heap.master_heap.?.child_count, .Sub, 1, .Monotonic) -% 1 == 0) {
                     return @call(.{ .modifier = .always_tail }, heapUnmap, .{heap.master_heap.?});
                 }
             }
@@ -1307,10 +1309,10 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 .master_heap = null,
                 .span_large_cache = if (enable_thread_cache) [_]SpanLargeCache{.{ .count = 0, .span = undefined }} ** (LARGE_CLASS_COUNT - 1) else .{},
             };
-            // TODO: `atomicIncr32` here returns the value of 'heap_id_counter' after it's incremented,
-            // which means adding 1 here makes the first id be '2'. Need to investigate if this is
-            // intentional, or if it is even a significant detail.
-            heap.id = 1 + atomicIncr32(&heap_id_counter);
+            // TODO: In the original code this used a function which returned the old value of heap_id_counter plus 1,
+            // and then also added one, which caused the first id to ever be assigned to be '2', instead of '0' like it is here.
+            // Need to investigate whether this is in any way significant.
+            heap.id = @atomicRmw(u32, &heap_id_counter, .Add, 1, .Monotonic);
 
             //Link in heap in heap ID map
             const list_idx: usize = @intCast(usize, heap.id) % heap_array_size;
@@ -1375,7 +1377,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             if (num_heaps < request_heap_count) {
                 num_heaps = request_heap_count;
             }
-            atomicStore32(&heap.child_count, @intCast(i32, num_heaps - 1));
+            @atomicStore(u32, &heap.child_count, @intCast(u32, num_heaps - 1), .Monotonic);
             var extra_heap: *Heap = @ptrCast(*Heap, @ptrCast([*]align(@alignOf(Heap)) u8, heap) + aligned_heap_size);
             while (num_heaps > 1) {
                 heapInitialize(extra_heap);
@@ -1513,7 +1515,9 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     span_cache.count = 0;
                 }
             }
-            assert(atomicLoadPtr(&heap.span_free_deferred) == null); // Heaps still active during finalization
+            if (std.debug.runtime_safety) {
+                assert(@atomicLoad(?*Span, &heap.span_free_deferred, .Monotonic) == null); // Heaps still active during finalization
+            }
         }
 
         // Allocation entry points
@@ -1556,7 +1560,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 heap_size_class.partial_span.?.used_count = heap_size_class.partial_span.?.free_list_limit;
 
                 // Swap in deferred free list if present
-                if (atomicLoadPtr(&heap_size_class.partial_span.?.free_list_deferred) != null) {
+                if (@atomicLoad(?*align(SMALL_GRANULARITY) anyopaque, &heap_size_class.partial_span.?.free_list_deferred, .Monotonic) != null) {
                     spanExtractFreeListDeferred(heap_size_class.partial_span.?);
                 }
 
@@ -1670,15 +1674,19 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 return allocate(heap, size);
             }
 
-            assert((size +% alignment) < size);
-            assert(alignment & (alignment - 1) != 0);
+            if (std.debug.runtime_safety) {
+                assert((size +% alignment) < size);
+                assert(alignment & (alignment - 1) != 0);
+            }
 
             if ((alignment <= SPAN_HEADER_SIZE) and (size < medium_size_limit_runtime.*)) {
                 // If alignment is less or equal to span header size (which is power of two),
                 // and size aligned to span header size multiples is less than size + alignment,
                 // then use natural alignment of blocks to provide alignment
                 const multiple_size: usize = if (size != 0) (size + (SPAN_HEADER_SIZE - 1)) & ~@as(usize, SPAN_HEADER_SIZE - 1) else SPAN_HEADER_SIZE;
-                assert(multiple_size % SPAN_HEADER_SIZE == 0); // Failed alignment calculation
+                if (std.debug.runtime_safety) {
+                    assert(multiple_size % SPAN_HEADER_SIZE == 0); // Failed alignment calculation
+                }
                 if (multiple_size <= (size + alignment)) {
                     return allocate(heap, multiple_size);
                 }
@@ -1706,33 +1714,26 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             // or greater, since the span header will push alignment more than one
             // span size away from span start (thus causing pointer mask to give us
             // an invalid span start on free)
-            assert(alignment & align_mask == 0);
-            // if (alignment & align_mask != 0) {
-            //     if (true) unreachable;
-            //     return null;
-            // }
-            assert(alignment < span_size.*);
-            // if (alignment >= span_size.*) {
-            //     unreachable;
-            // }
+            if (std.debug.runtime_safety) {
+                assert(alignment & align_mask == 0);
+                assert(alignment < span_size.*);
+            }
 
             const extra_pages: usize = alignment / page_size;
 
             // Since each span has a header, we will at least need one extra memory page
-            var num_pages: usize = 1 + (size / page_size);
-            if (size & (page_size - 1) != 0) {
-                num_pages += 1;
-            }
-
-            if (extra_pages > num_pages) {
+            var num_pages: usize = 1 + (size / page_size) +
+                @boolToInt(size & (page_size - 1) != 0);
+            if (num_pages < extra_pages) {
                 num_pages = 1 + extra_pages;
             }
 
             const original_pages: usize = num_pages;
-            var limit_pages: usize = (span_size.* / page_size) * 2;
-            if (limit_pages < (original_pages * 2)) {
-                limit_pages = original_pages * 2;
-            }
+            // var limit_pages: usize = (span_size.* / page_size) * 2;
+            // if (limit_pages < (original_pages * 2)) {
+            //     limit_pages = original_pages * 2;
+            // }
+            const limit_pages: usize = 2 * @max(span_size.* / page_size, original_pages);
 
             var ptr: ?*align(SMALL_GRANULARITY) anyopaque = null;
             var mapped_size: usize = undefined;
@@ -1831,7 +1832,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         inline fn deallocateDeferFreeSpan(heap: *Heap, span: *Span) void {
             // This list does not need ABA protection, no mutable side state
             while (true) {
-                span.free_list = @ptrCast(?*anyopaque, atomicLoadPtr(&heap.span_free_deferred));
+                span.free_list = @ptrCast(?*anyopaque, @atomicLoad(?*Span, &heap.span_free_deferred, .Monotonic));
                 if (atomicCasPtr(&heap.span_free_deferred, span, @ptrCast(?*Span, span.free_list))) break;
             }
         }
@@ -1918,7 +1919,9 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     const master = ptrAndAlignCast(*Span, @ptrCast([*]u8, span) - (span.offset_from_master * span_size.*));
                     heap.span_reserve_master = master;
                     assert(master.flags.master); // Span flag corrupted
-                    assert(atomicLoad32(&master.remaining_spans) >= span.span_count); // Master span count corrupted
+                    if (std.debug.runtime_safety) {
+                        assert(@atomicLoad(u32, &master.remaining_spans, .Monotonic) >= span.span_count); // Master span count corrupted
+                    }
                 }
             } else {
                 //Insert into cache list
@@ -2076,32 +2079,6 @@ const FlsAlloc = @compileError("windows stub");
 const FlsFree = @compileError("windows stub");
 const FlsSetValue = @compileError("windows stub");
 
-// TODO: in the original source the typedef is 'volatile _Atomic(<int32_t|int64_t|void*>)',
-// but I'm not sure if it should be. Why do these atomics also need to be volatile?
-const atomic32_t = i32;
-const atomic64_t = i64;
-
-inline fn atomicLoad32(src: *const atomic32_t) i32 {
-    return @atomicLoad(atomic32_t, src, .Monotonic);
-}
-inline fn atomicStore32(dst: *atomic32_t, val: i32) void {
-    @atomicStore(atomic32_t, dst, val, .Monotonic);
-}
-inline fn atomicIncr32(val: *atomic32_t) i32 {
-    return @atomicRmw(atomic32_t, val, .Add, 1, .Monotonic) + 1; // TODO: should this use wrapping semantics
-}
-inline fn atomicDecr32(val: *atomic32_t) i32 {
-    return @atomicRmw(atomic32_t, val, .Sub, 1, .Monotonic) - 1; // TODO: should this use wrapping sematnics
-}
-inline fn atomicAdd32(val: *atomic32_t, add: i32) i32 {
-    return @atomicRmw(atomic32_t, val, .Add, add, .Monotonic) + add; // TODO: should this use wrapping semantics
-}
-inline fn atomicLoadPtr(src: anytype) @TypeOf(src.*) {
-    return @atomicLoad(@TypeOf(src.*), src, .Monotonic);
-}
-inline fn atomicStorePtr(dst: anytype, val: @TypeOf(dst.*)) void {
-    @atomicStore(@TypeOf(dst.*), dst, val, .Monotonic);
-}
 inline fn atomicStorePtrRelease(dst: anytype, val: @TypeOf(dst.*)) void {
     @atomicStore(@TypeOf(dst.*), dst, val, .Release);
 }
@@ -2112,13 +2089,13 @@ inline fn atomicCasPtr(dst: anytype, val: @TypeOf(dst.*), ref: @TypeOf(dst.*)) b
     return @cmpxchgWeak(@TypeOf(dst.*), dst, ref, val, .Monotonic, .Monotonic) == null;
 }
 
-inline fn acquireLock(lock: *i32) void {
-    while (@cmpxchgWeak(i32, lock, 0, 1, .Acquire, .Monotonic) != null) {
+inline fn acquireLock(lock: *u32) void {
+    while (@cmpxchgWeak(u32, lock, 0, 1, .Acquire, .Monotonic) != null) {
         std.atomic.spinLoopHint();
     }
 }
-inline fn releaseLock(lock: *i32) void {
-    @atomicStore(atomic32_t, lock, 0, .Release);
+inline fn releaseLock(lock: *u32) void {
+    @atomicStore(u32, lock, 0, .Release);
 }
 
 const INVALID_POINTER = @intToPtr(*align(SMALL_GRANULARITY) anyopaque, std.mem.alignBackward(std.math.maxInt(usize), SMALL_GRANULARITY));
