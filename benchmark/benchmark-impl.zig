@@ -1,26 +1,72 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const rpmalloc = @import("rpmalloc");
+
+var rpmalloc_gpa = if (!build_options.port_safety) @compileError("don't reference") else std.heap.GeneralPurposeAllocator(.{
+    .stack_trace_frames = 64,
+    .retain_metadata = true,
+    .never_unmap = true,
+    .safety = true,
+    .thread_safe = false,
+}){};
+const Rp = rpmalloc.RPMalloc(.{
+    .backing_allocator = if (!build_options.port_safety) &std.heap.page_allocator else &rpmalloc_gpa.allocator(),
+});
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-const Rp = rpmalloc.RPMalloc(.{});
-const allocator = Rp.allocator();
+
+const allocator = switch (build_options.impl) {
+    else => unreachable,
+    .port => Rp.allocator(),
+    .gpa => gpa.allocator(),
+};
 
 export fn benchmark_initialize() c_int {
-    Rp.init(null, .{}) catch return -1;
-    return 0;
+    switch (build_options.impl) {
+        else => unreachable,
+        .port => {
+            if (build_options.port_safety) {
+                rpmalloc_gpa = .{};
+            }
+            Rp.init(null, .{}) catch return -1;
+            return 0;
+        },
+        .gpa => gpa = .{},
+    }
 }
 
 export fn benchmark_finalize() c_int {
-    Rp.deinit();
+    switch (build_options.impl) {
+        else => unreachable,
+        .port => {
+            Rp.deinit();
+            if (build_options.port_safety) {
+                if (rpmalloc_gpa.deinit()) return -1;
+            }
+        },
+        .gpa => if (gpa.deinit()) return -1,
+    }
     return 0;
 }
 
 export fn benchmark_thread_initialize() c_int {
-    Rp.initThread() catch return -1;
+    switch (build_options.impl) {
+        else => unreachable,
+        .port => {
+            Rp.initThread() catch return -1;
+        },
+        .gpa => {},
+    }
     return 0;
 }
 
 export fn benchmark_thread_finalize() c_int {
-    Rp.deinitThread(true);
+    switch (build_options.impl) {
+        .port => {
+            Rp.deinitThread(true);
+        },
+        .gpa => {},
+        else => unreachable,
+    }
     return 0;
 }
 
@@ -29,7 +75,6 @@ export fn benchmark_thread_collect() void {
 }
 
 export fn benchmark_malloc(alignment: usize, size: usize) ?*anyopaque {
-    //return rpmemalign(alignment, size);
     return allocator.rawAlloc(size, if (alignment != 0) std.math.log2_int(usize, alignment) else 1, 0);
 }
 
@@ -38,5 +83,5 @@ export fn benchmark_free(ptr: ?*anyopaque) void {
 }
 
 export fn benchmark_name() [*:0]const u8 {
-    return "zig-rpmalloc";
+    return @tagName(build_options.impl);
 }

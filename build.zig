@@ -4,7 +4,12 @@ pub fn build(b: *std.build.Builder) void {
     const mode = b.standardReleaseOptions();
     const target = b.standardTargetOptions(.{});
 
-    const bench_implementation = b.option(enum { zig, c }, "impl", "Which impl of the benchmark to run") orelse .zig;
+    const BenchImplementation = enum {
+        original,
+        port,
+        gpa,
+    };
+    const bench_implementation = b.option(BenchImplementation, "impl", "Which impl of the benchmark to run") orelse .port;
     const strip = b.option(bool, "strip", "Strip executable");
     const want_lto = b.option(bool, "want-lto", "Enable wanting LTO");
     const single_threaded = b.option(bool, "single-threaded", "Disable threading");
@@ -23,6 +28,30 @@ pub fn build(b: *std.build.Builder) void {
     zig_bench_impl_leo.single_threaded = single_threaded;
     zig_bench_impl_leo.emit_asm = if (emit_asm) |cond| (if (cond) .emit else .no_emit) else if (emit_asm_to) |path| .{ .emit_to = path } else .default;
     zig_bench_impl_leo.addPackagePath("rpmalloc", "src/rpmalloc.zig");
+    const zig_bench_impl_options = b.addOptions();
+    zig_bench_impl_leo.addOptions("build_options", zig_bench_impl_options);
+    zig_bench_impl_options.addOption(bool, "port_safety", b.option(bool, "port-safety", "Use GPA as the backing allocator to check for leaks") orelse false);
+    switch (bench_implementation) {
+        .port, .gpa => {
+            zig_bench_impl_options.contents.writer().writeAll(
+                \\pub const BenchImplementation = enum {
+            ) catch unreachable;
+            inline for (@typeInfo(BenchImplementation).Enum.fields) |field| {
+                zig_bench_impl_options.contents.writer().print("    {s},", .{field.name}) catch unreachable;
+            }
+            zig_bench_impl_options.contents.writer().writeAll("};\n") catch unreachable;
+            zig_bench_impl_options.contents.writer().print(
+                \\pub const impl: BenchImplementation = .{s};
+                \\
+            , .{@tagName(bench_implementation)}) catch unreachable;
+        },
+        else => {
+            zig_bench_impl_options.contents.writer().print(
+                \\pub const impl = @compileError("Not implemented for {s}");
+                \\
+            , .{@tagName(bench_implementation)}) catch unreachable;
+        },
+    }
 
     const c_bench_impl_leo = b.addStaticLibrary("benchmark-impl-c", "benchmark/rpmalloc-benchmark/benchmark/rpmalloc/benchmark.c");
     c_bench_impl_leo.setBuildMode(mode);
@@ -55,8 +84,10 @@ pub fn build(b: *std.build.Builder) void {
     }, &.{"-O3"});
 
     switch (bench_implementation) {
-        .zig => bench_leo.linkLibrary(zig_bench_impl_leo),
-        .c => bench_leo.linkLibrary(c_bench_impl_leo),
+        .original => bench_leo.linkLibrary(c_bench_impl_leo),
+        .port,
+        .gpa,
+        => bench_leo.linkLibrary(zig_bench_impl_leo),
     }
     bench_leo.install();
 
