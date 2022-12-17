@@ -1092,7 +1092,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 }
             } else {
                 if (@atomicRmw(u32, &heap.master_heap.?.child_count, .Sub, 1, .Monotonic) -% 1 == 0) {
-                    return @call(.always_tail, heapUnmap, .{ heap.master_heap.?, ret_addr });
+                    return @call(.{.modifier = .always_tail}, heapUnmap, .{ heap.master_heap.?, ret_addr });
                 }
             }
         }
