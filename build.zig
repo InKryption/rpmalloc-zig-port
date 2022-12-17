@@ -10,15 +10,17 @@ pub fn build(b: *std.build.Builder) void {
         gpa,
     };
     const bench_implementation = b.option(BenchImplementation, "impl", "Which impl of the benchmark to run") orelse .port;
+
+    // Some general compiler options
+    const link_libc = b.option(bool, "link-c", "Unconditionally link libc.") orelse false;
     const strip = b.option(bool, "strip", "Strip executable");
     const want_lto = b.option(bool, "want-lto", "Enable wanting LTO");
     const single_threaded = b.option(bool, "single-threaded", "Disable threading");
-    const emit_asm = b.option(bool, "emit-asm", "Emit assembly");
-    const emit_asm_to = b.option([]const u8, "emit-asm-to", "Emit assembly");
-    std.debug.assert(
-        (emit_asm == null and emit_asm_to == null) or
-            (emit_asm != null) != (emit_asm_to != null),
-    );
+    const emit_asm: std.build.LibExeObjStep.EmitOption = if (b.option(bool, "emit-asm", "Emit assembly")) |cond| (if (cond) .emit else .no_emit) else .default;
+
+    // More specific options for zig
+    const port_safety = b.option(bool, "port-safety", "Use GPA as the backing allocator to check for leaks") orelse false;
+    const zig_malloc = b.option(bool, "zig-malloc", "Back the zig allocator using the C allocator; useful for testing with valgrind") orelse false;
 
     const zig_bench_impl_leo = b.addStaticLibrary("benchmark-impl-zig", "benchmark/benchmark-impl.zig");
     zig_bench_impl_leo.setBuildMode(mode);
@@ -26,31 +28,19 @@ pub fn build(b: *std.build.Builder) void {
     zig_bench_impl_leo.strip = strip;
     zig_bench_impl_leo.want_lto = want_lto;
     zig_bench_impl_leo.single_threaded = single_threaded;
-    zig_bench_impl_leo.emit_asm = if (emit_asm) |cond| (if (cond) .emit else .no_emit) else if (emit_asm_to) |path| .{ .emit_to = path } else .default;
+    zig_bench_impl_leo.emit_asm = emit_asm;
+    if (link_libc or zig_malloc) zig_bench_impl_leo.linkLibC();
     zig_bench_impl_leo.addPackagePath("rpmalloc", "src/rpmalloc.zig");
-    const zig_bench_impl_options = b.addOptions();
-    zig_bench_impl_leo.addOptions("build_options", zig_bench_impl_options);
-    zig_bench_impl_options.addOption(bool, "port_safety", b.option(bool, "port-safety", "Use GPA as the backing allocator to check for leaks") orelse false);
-    switch (bench_implementation) {
-        .port, .gpa => {
-            zig_bench_impl_options.contents.writer().writeAll(
-                \\pub const BenchImplementation = enum {
-            ) catch unreachable;
-            inline for (@typeInfo(BenchImplementation).Enum.fields) |field| {
-                zig_bench_impl_options.contents.writer().print("    {s},", .{field.name}) catch unreachable;
-            }
-            zig_bench_impl_options.contents.writer().writeAll("};\n") catch unreachable;
-            zig_bench_impl_options.contents.writer().print(
-                \\pub const impl: BenchImplementation = .{s};
-                \\
-            , .{@tagName(bench_implementation)}) catch unreachable;
-        },
-        else => {
-            zig_bench_impl_options.contents.writer().print(
-                \\pub const impl = @compileError("Not implemented for {s}");
-                \\
-            , .{@tagName(bench_implementation)}) catch unreachable;
-        },
+
+    {
+        const zig_bench_impl_options = b.addOptions();
+        zig_bench_impl_leo.addOptions("build_options", zig_bench_impl_options);
+        zig_bench_impl_options.addOption(bool, "port_safety", port_safety);
+        zig_bench_impl_options.addOption(bool, "zig_malloc", zig_malloc);
+        zig_bench_impl_options.contents.writer().print(
+            \\pub const impl = .{s};
+            \\
+        , .{@tagName(bench_implementation)}) catch unreachable;
     }
 
     const c_bench_impl_leo = b.addStaticLibrary("benchmark-impl-c", "benchmark/rpmalloc-benchmark/benchmark/rpmalloc/benchmark.c");
@@ -59,12 +49,13 @@ pub fn build(b: *std.build.Builder) void {
     c_bench_impl_leo.strip = strip;
     c_bench_impl_leo.want_lto = want_lto;
     c_bench_impl_leo.single_threaded = single_threaded;
+    c_bench_impl_leo.emit_asm = emit_asm;
+    c_bench_impl_leo.linkLibC();
     c_bench_impl_leo.addIncludePath("benchmark/rpmalloc-benchmark/benchmark");
     c_bench_impl_leo.addIncludePath("benchmark/rpmalloc-benchmark/test");
     c_bench_impl_leo.addCSourceFiles(&.{
         "benchmark/rpmalloc-benchmark/benchmark/rpmalloc/rpmalloc.c",
     }, &.{"-O3"});
-    c_bench_impl_leo.linkLibC();
 
     const bench_leo = b.addExecutable(switch (bench_implementation) {
         inline else => |tag| "benchmark-" ++ @tagName(tag),

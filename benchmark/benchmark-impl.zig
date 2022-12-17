@@ -7,16 +7,23 @@ var rpmalloc_gpa = if (!build_options.port_safety) @compileError("don't referenc
     .retain_metadata = true,
     .never_unmap = true,
     .safety = true,
-    .thread_safe = false,
-}){};
+    .thread_safe = false, // rpmalloc should already be thread safe
+}){ .backing_allocator = if (build_options.zig_malloc) std.heap.c_allocator else std.heap.page_allocator };
 const Rp = rpmalloc.RPMalloc(.{
-    .backing_allocator = if (!build_options.port_safety) &std.heap.page_allocator else &rpmalloc_gpa.allocator(),
+    .backing_allocator = blk: {
+        if (build_options.port_safety) break :blk &rpmalloc_gpa.allocator();
+        if (build_options.zig_malloc) break :blk &std.heap.c_allocator;
+        break :blk &std.heap.page_allocator;
+    },
 });
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+
+var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{
+    .backing_allocator = if (build_options.zig_malloc) std.heap.c_allocator else std.heap.page_allocator,
+};
 
 const allocator = switch (build_options.impl) {
     else => unreachable,
-    .port => Rp.allocator(),
+    .port => Rp.allocator,
     .gpa => gpa.allocator(),
 };
 
