@@ -1132,7 +1132,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             }
 
             // Heap is now completely free, unmap and remove from heap list
-            const list_idx: usize = @intCast(usize, heap.id) % heap_array_size;
+            const list_idx: usize = heap.id % heap_array_size;
             var list_heap: ?*Heap = all_heaps[list_idx].?;
             if (list_heap == heap) {
                 all_heaps[list_idx] = heap.next_heap;
@@ -1335,7 +1335,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             heap.id = @atomicRmw(u32, &heap_id_counter, .Add, 1, .Monotonic);
 
             //Link in heap in heap ID map
-            const list_idx: usize = @intCast(usize, heap.id) % heap_array_size;
+            const list_idx: usize = heap.id % heap_array_size;
             heap.next_heap = all_heaps[list_idx];
             all_heaps[list_idx] = heap;
         }
