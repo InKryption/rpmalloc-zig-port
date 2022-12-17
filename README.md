@@ -7,7 +7,6 @@ zig build bench -D=[port|original|...]
 ```
 
 ## WIP
-At present this leaks memory.
 This project is under development, does not guarantee a stable API and lacks documentation and tests.
 Contributions, in the form of PRs and relevant resources, are greatly appreciated.
 
