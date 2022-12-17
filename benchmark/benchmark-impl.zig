@@ -39,6 +39,7 @@ export fn benchmark_initialize() c_int {
         },
         .gpa => gpa = .{},
     }
+    return 0;
 }
 
 export fn benchmark_finalize() c_int {
