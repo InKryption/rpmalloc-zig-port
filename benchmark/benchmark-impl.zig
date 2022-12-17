@@ -23,7 +23,7 @@ var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{
 
 const allocator = switch (build_options.impl) {
     else => unreachable,
-    .port => Rp.allocator,
+    .port => Rp.allocator(),
     .gpa => gpa.allocator(),
 };
 
