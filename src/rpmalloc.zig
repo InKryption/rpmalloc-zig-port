@@ -747,8 +747,8 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             }
 
             std.debug.assert(span.span_count != 0);
-            const prev_remaining_spans = @atomicRmw(u32, &master.remaining_spans, .Sub, span.span_count, .Monotonic);
-            if (prev_remaining_spans -% span.span_count >= prev_remaining_spans) {
+            const prev_remaining_spans: i64 = @atomicRmw(u32, &master.remaining_spans, .Sub, span.span_count, .Monotonic);
+            if (prev_remaining_spans - span.span_count <= 0) {
                 // Everything unmapped, unmap the master span with release flag to unmap the entire range of the super span
                 assert(master.flags.master and master.flags.subspan); // Span flag corrupted
                 memoryUnmap(master, master.align_offset, @as(usize, master.total_spans) * span_size.*, ret_addr);
