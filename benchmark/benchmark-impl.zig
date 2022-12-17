@@ -69,11 +69,11 @@ export fn benchmark_thread_initialize() c_int {
 
 export fn benchmark_thread_finalize() c_int {
     switch (build_options.impl) {
+        else => unreachable,
         .port => {
             Rp.deinitThread(true);
         },
         .gpa => {},
-        else => unreachable,
     }
     return 0;
 }
