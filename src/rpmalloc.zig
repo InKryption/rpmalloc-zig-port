@@ -1858,7 +1858,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 const blocks_start: *align(SMALL_GRANULARITY) anyopaque = @ptrCast([*]align(SMALL_GRANULARITY) u8, span) + SPAN_HEADER_SIZE;
                 const block_offset = @ptrToInt(p) - @ptrToInt(blocks_start);
                 const offset_mod_size = @intCast(u32, block_offset % span.block_size);
-                assert(offset_mod_size == 0); // TODO: this seems to be empirically true
                 p = ptrAndAlignCast(*align(SMALL_GRANULARITY) anyopaque, @ptrCast([*]u8, p) - offset_mod_size);
             }
 
