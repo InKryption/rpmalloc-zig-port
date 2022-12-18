@@ -17,14 +17,9 @@ const Rp = rpmalloc.RPMalloc(.{
     },
 });
 
-var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{
-    .backing_allocator = if (build_options.zig_malloc) std.heap.c_allocator else std.heap.page_allocator,
-};
-
 const allocator = switch (build_options.impl) {
     else => unreachable,
     .port => Rp.allocator(),
-    .gpa => gpa.allocator(),
 };
 
 export fn benchmark_initialize() c_int {
@@ -35,9 +30,7 @@ export fn benchmark_initialize() c_int {
                 rpmalloc_gpa = .{};
             }
             Rp.init(null, .{}) catch return -1;
-            return 0;
         },
-        .gpa => gpa = .{},
     }
     return 0;
 }
@@ -51,7 +44,6 @@ export fn benchmark_finalize() c_int {
                 if (rpmalloc_gpa.deinit()) return -1;
             }
         },
-        .gpa => if (gpa.deinit()) return -1,
     }
     return 0;
 }
@@ -62,7 +54,6 @@ export fn benchmark_thread_initialize() c_int {
         .port => {
             Rp.initThread() catch return -1;
         },
-        .gpa => {},
     }
     return 0;
 }
@@ -73,7 +64,6 @@ export fn benchmark_thread_finalize() c_int {
         .port => {
             Rp.deinitThread(true);
         },
-        .gpa => {},
     }
     return 0;
 }

@@ -7,7 +7,6 @@ pub fn build(b: *std.build.Builder) void {
     const BenchImplementation = enum {
         original,
         port,
-        gpa,
     };
     const bench_implementation = b.option(BenchImplementation, "impl", "Which impl of the benchmark to run") orelse .port;
 
@@ -76,9 +75,7 @@ pub fn build(b: *std.build.Builder) void {
 
     switch (bench_implementation) {
         .original => bench_leo.linkLibrary(c_bench_impl_leo),
-        .port,
-        .gpa,
-        => bench_leo.linkLibrary(zig_bench_impl_leo),
+        .port => bench_leo.linkLibrary(zig_bench_impl_leo),
     }
     bench_leo.install();
 
