@@ -55,7 +55,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
     }
 
     const known_allocator = options.backing_allocator != null;
-    const is_windows_and_not_dynamic = builtin.os.tag == .windows and builtin.link_mode != .Dynamic;
 
     return struct {
         pub inline fn allocator() Allocator {
@@ -107,15 +106,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 span_map_count = (page_size / span_size.*);
             }
             heap_reserve_count = if (span_map_count > default_span_map_count) default_span_map_count else span_map_count;
-
-            // TODO: evaluate if this is worth doing.
-            if (is_windows_and_not_dynamic) {
-                fls_key = FlsAlloc(&struct {
-                    fn threadDestructor(value: ?*anyopaque) callconv(.Stdcall) void {
-                        if (value != null) threadFinalize(true);
-                    }
-                }.threadDestructor);
-            }
 
             // Setup all small and medium size classes
             if (configurable_sizes) {
@@ -183,12 +173,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 }
             }
 
-            // TODO: evaluate if this is worth doing
-            if (is_windows_and_not_dynamic) {
-                FlsFree(fls_key);
-                fls_key = 0;
-            }
-
             initialized = false;
         }
         pub inline fn deinitThread(release_caches: bool) void {
@@ -203,7 +187,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
             const result_ptr = alignedAllocate(
                 thread_heap.?,
-                @as(u64, 1) << @intCast(u6, ptr_align_log2),
+                @intCast(u6, ptr_align_log2),
                 len,
                 ret_addr,
             ) orelse return null;
@@ -243,8 +227,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 deallocateHuge(span, ret_addr);
             }
         }
-
-        var fls_key: std.os.windows.DWORD = if (is_windows_and_not_dynamic) 0 else @compileError("can't reference");
 
         /// Maximum allocation size to avoid integer overflow
         inline fn maxAllocSize() @TypeOf(span_size.*) {
@@ -1683,12 +1665,12 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             return allocateHuge(heap, size, ret_addr);
         }
 
-        inline fn alignedAllocate(heap: *Heap, alignment: usize, size: usize, ret_addr: usize) ?*align(SMALL_GRANULARITY) anyopaque {
-            if (alignment <= SMALL_GRANULARITY) {
-                // if (size >= maxAllocSize()) return null;
-                assert(size < maxAllocSize());
+        inline fn alignedAllocate(heap: *Heap, align_log2: u6, size: usize, ret_addr: usize) ?*align(SMALL_GRANULARITY) anyopaque {
+            if (size > maxAllocSize()) return null;
+            if (align_log2 <= SMALL_GRANULARITY_SHIFT) {
                 return allocate(heap, size, ret_addr);
             }
+            const alignment = @as(usize, 1) << align_log2;
 
             if ((alignment <= SPAN_HEADER_SIZE) and (size < medium_size_limit_runtime.*)) {
                 // If alignment is less or equal to span header size (which is power of two),
@@ -1715,6 +1697,8 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 }
                 return ptr;
             }
+
+            // TODO: To delete, or not to delete the rest of this code, that is the question.
 
             // Fallback to mapping new pages for this request. Since pointers passed
             // to rpfree must be able to reach the start of the span by bitmasking of
@@ -2012,9 +1996,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         inline fn threadInitialize(ret_addr: usize) error{OutOfMemory}!void {
             const heap = heapAllocate(ret_addr) orelse return error.OutOfMemory;
             setThreadHeap(heap);
-            if (is_windows_and_not_dynamic) {
-                FlsSetValue(fls_key, heap);
-            }
         }
 
         /// Finalize thread, orphan heap
@@ -2022,9 +2003,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             if (thread_heap != null) {
                 heapRelease(thread_heap.?, release_caches, ret_addr);
                 setThreadHeap(null);
-            }
-            if (is_windows_and_not_dynamic) {
-                FlsSetValue(fls_key, 0);
             }
         }
 
@@ -2058,10 +2036,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
     };
 }
 
-const FlsAlloc = @compileError("windows stub");
-const FlsFree = @compileError("windows stub");
-const FlsSetValue = @compileError("windows stub");
-
 inline fn atomicStorePtrRelease(dst: anytype, val: @TypeOf(dst.*)) void {
     @atomicStore(@TypeOf(dst.*), dst, val, .Release);
 }
@@ -2090,7 +2064,7 @@ const SIZE_CLASS_HUGE = std.math.maxInt(u32);
 /// Granularity of a small allocation block (must be power of two)
 const SMALL_GRANULARITY = 16;
 /// Small granularity shift count
-const SMALL_GRANULARITY_SHIFT = 4;
+const SMALL_GRANULARITY_SHIFT = std.math.log2(SMALL_GRANULARITY);
 /// Number of small block size classes
 const SMALL_CLASS_COUNT = 65;
 /// Maximum size of a small block
@@ -2126,7 +2100,7 @@ const MAX_THREAD_SPAN_LARGE_CACHE = 100;
 const THREAD_SPAN_LARGE_CACHE_TRANSFER = 6;
 
 comptime {
-    if ((SMALL_GRANULARITY & (SMALL_GRANULARITY - 1)) != 0) @compileError("Small granularity must be power of two");
+    if (@popCount(@as(std.math.IntFittingRange(0, SMALL_GRANULARITY), SMALL_GRANULARITY)) != 1) @compileError("Small granularity must be power of two");
     if ((SPAN_HEADER_SIZE & (SPAN_HEADER_SIZE - 1)) != 0) @compileError("Span header size must be power of two");
     assert(SPAN_HEADER_SIZE % SMALL_GRANULARITY == 0);
 }
