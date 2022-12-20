@@ -4,17 +4,15 @@ pub fn build(b: *std.build.Builder) void {
     const mode = b.standardReleaseOptions();
     const target = b.standardTargetOptions(.{});
 
-    const BenchImplementation = enum {
-        original,
-        port,
-    };
+    const BenchImplementation = enum { original, port };
     const bench_implementation = b.option(BenchImplementation, "impl", "Which impl of the benchmark to run") orelse .port;
 
     // Some general compiler options
     const link_libc = b.option(bool, "link-c", "Unconditionally link libc.") orelse false;
     const strip = b.option(bool, "strip", "Strip executable");
     const want_lto = b.option(bool, "want-lto", "Enable wanting LTO");
-    const single_threaded = b.option(bool, "single-threaded", "Disable threading");
+    const single_threaded = b.option(bool, "single-threaded", "Disable threading") orelse false;
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Enable thread sanitizaion") orelse false;
     const emit_asm: std.build.LibExeObjStep.EmitOption = if (b.option(bool, "emit-asm", "Emit assembly")) |cond| (if (cond) .emit else .no_emit) else .default;
 
     // More specific options for zig
@@ -28,6 +26,8 @@ pub fn build(b: *std.build.Builder) void {
     zig_bench_impl_leo.want_lto = want_lto;
     zig_bench_impl_leo.single_threaded = single_threaded;
     zig_bench_impl_leo.emit_asm = emit_asm;
+    zig_bench_impl_leo.sanitize_thread = sanitize_thread;
+    zig_bench_impl_leo.disable_sanitize_c = false;
     if (link_libc or zig_malloc) zig_bench_impl_leo.linkLibC();
     zig_bench_impl_leo.addPackagePath("rpmalloc", "src/rpmalloc.zig");
 
@@ -48,6 +48,8 @@ pub fn build(b: *std.build.Builder) void {
     c_bench_impl_leo.strip = strip;
     c_bench_impl_leo.want_lto = want_lto;
     c_bench_impl_leo.single_threaded = single_threaded;
+    c_bench_impl_leo.sanitize_thread = sanitize_thread;
+    c_bench_impl_leo.disable_sanitize_c = false;
     c_bench_impl_leo.emit_asm = emit_asm;
     c_bench_impl_leo.linkLibC();
     c_bench_impl_leo.addIncludePath("benchmark/rpmalloc-benchmark/benchmark");
@@ -64,6 +66,8 @@ pub fn build(b: *std.build.Builder) void {
     bench_leo.strip = strip;
     bench_leo.want_lto = want_lto;
     bench_leo.single_threaded = single_threaded;
+    bench_leo.sanitize_thread = sanitize_thread;
+    bench_leo.disable_sanitize_c = false;
 
     bench_leo.linkLibC();
     bench_leo.addIncludePath("benchmark/rpmalloc-benchmark/benchmark");
