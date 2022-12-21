@@ -91,7 +91,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             if (config.span_size != .default) {
                 comptime assert(configurable_sizes);
                 span_size_mut = @enumToInt(config.span_size);
-                span_size_shift_mut = std.math.log2_int(usize, span_size.*);
+                span_size_shift_mut = log2(span_size.*);
                 span_mask_mut = calculateSpanMask(span_size.*);
             } // otherwise, they're either not confiburable, or they're already set to default values.
 
@@ -365,7 +365,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
         /// Default span size (64KiB)
         const default_span_size = 64 * 1024;
-        const default_span_size_shift = std.math.log2(default_span_size);
+        const default_span_size_shift = log2(default_span_size);
         inline fn calculateSpanMask(input_span_size: anytype) @TypeOf(input_span_size) {
             assert(@popCount(@as(std.math.IntFittingRange(0, input_span_size), input_span_size)) == 1);
             return ~@as(usize, input_span_size - 1);
@@ -383,7 +383,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         var main_thread_id: ThreadId = 0;
         const page_size: usize = std.mem.page_size;
         /// Shift to divide by page size
-        const page_size_shift: std.math.Log2Int(usize) = std.math.log2_int(usize, page_size);
+        const page_size_shift: std.math.Log2Int(usize) = log2(page_size);
         /// Granularity at which memory pages are mapped by OS
         const map_granularity: usize = page_size;
 
@@ -475,7 +475,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             var ptr: *align(page_size) anyopaque = blk: {
                 const ptr = backing_allocator.rawAlloc(
                     size + padding,
-                    comptime std.math.log2_int(usize, page_size),
+                    comptime log2(page_size),
                     @returnAddress(),
                 ) orelse return null;
                 break :blk @alignCast(page_size, ptr);
@@ -2066,6 +2066,18 @@ const Lock = enum(u32) {
     }
 };
 
+inline fn log2(x: anytype) switch (@typeInfo(@TypeOf(x))) {
+    .Int => std.math.Log2Int(@TypeOf(x)),
+    .ComptimeInt => comptime_int,
+} {
+    const T = @TypeOf(x);
+    return switch (@typeInfo(T)) {
+        .Int => std.math.log2_int(T, x),
+        .ComptimeInt => std.math.log2(x),
+        else => @compileError("can't get log₂ of type " ++ @typeName(T)),
+    };
+}
+
 const INVALID_POINTER = @intToPtr(*align(SMALL_GRANULARITY) anyopaque, std.mem.alignBackward(std.math.maxInt(usize), SMALL_GRANULARITY));
 const SIZE_CLASS_LARGE = SIZE_CLASS_COUNT;
 const SIZE_CLASS_HUGE = std.math.maxInt(u32);
@@ -2075,7 +2087,7 @@ const SIZE_CLASS_HUGE = std.math.maxInt(u32);
 /// Granularity of a small allocation block (must be power of two)
 const SMALL_GRANULARITY = 16;
 /// Small granularity shift count
-const SMALL_GRANULARITY_SHIFT = std.math.log2(SMALL_GRANULARITY);
+const SMALL_GRANULARITY_SHIFT = log2(SMALL_GRANULARITY);
 /// Number of small block size classes
 const SMALL_CLASS_COUNT = 65;
 /// Maximum size of a small block
