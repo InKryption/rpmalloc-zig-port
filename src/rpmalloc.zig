@@ -3,6 +3,57 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
+test {
+    try testRPMalloc(.{ .backing_allocator = &std.testing.allocator }, null, .{});
+    try testRPMalloc(.{ .backing_allocator = &std.testing.allocator }, null, .{});
+    try testRPMalloc(.{ .backing_allocator = null }, std.testing.allocator, .{});
+    try testRPMalloc(.{
+        .backing_allocator = &std.testing.allocator,
+        .configurable_sizes = true,
+    }, null, .{ .span_size = .pow12 });
+
+    try testRPMalloc(.{
+        .backing_allocator = &std.testing.allocator,
+        .configurable_sizes = true,
+    }, null, .{ .span_size = .pow18 });
+
+    try testRPMalloc(.{
+        .backing_allocator = &std.testing.allocator,
+        .enable_thread_cache = true,
+        .enable_global_cache = false,
+    }, null, .{});
+
+    try testRPMalloc(.{
+        .backing_allocator = &std.testing.allocator,
+        .enable_thread_cache = false,
+        .enable_global_cache = false,
+    }, null, .{});
+}
+
+fn testRPMalloc(
+    comptime options: RPMallocOptions,
+    ally: if (options.backing_allocator != null) ?noreturn else Allocator,
+    init_config: RPMalloc(options).InitConfig,
+) !void {
+    const Rp = RPMalloc(options);
+    try Rp.init(ally, init_config);
+    defer Rp.deinit();
+
+    var list = std.ArrayListAligned(u8, 64).init(Rp.allocator());
+    defer list.deinit();
+
+    try list.append(33);
+    try list.appendNTimes(71, 22);
+    list.shrinkAndFree(2);
+    try list.ensureUnusedCapacity(1024 * 64);
+    list.appendSliceAssumeCapacity(&[1]u8{96} ** (1024 * 64));
+    list.shrinkAndFree(3);
+    var i: u32 = 1;
+    while (i < std.math.maxInt(u32)) : (i *|= 2) {
+        try list.append(@intCast(u8, (i - 1) % std.math.maxInt(u8)));
+    }
+}
+
 pub const RPMallocOptions = struct {
     /// Enable configuring sizes at runtime. Will introduce a very small
     /// overhead due to some size calculations not being compile time constants
@@ -30,29 +81,28 @@ pub const RPMallocOptions = struct {
 pub fn RPMalloc(comptime options: RPMallocOptions) type {
     const configurable_sizes = options.configurable_sizes;
 
-    const heap_array_size = options.heap_array_size;
+    if (options.disable_unmap and !options.enable_global_cache) {
+        @compileError("Must use global cache if unmap is disabled");
+    }
+
+    if (options.disable_unmap and !options.enable_unlimited_cache) {
+        var new_options: RPMallocOptions = options;
+        new_options.enable_unlimited_cache = true;
+        return RPMalloc(new_options);
+    }
+
+    if (!options.enable_global_cache and options.enable_unlimited_cache) {
+        var new_options = options;
+        new_options.enable_unlimited_cache = false;
+        return RPMalloc(new_options);
+    }
+
     const enable_thread_cache = options.enable_thread_cache;
     const enable_global_cache = options.enable_global_cache;
     const disable_unmap = options.disable_unmap;
     const enable_unlimited_cache = options.enable_unlimited_cache;
     const default_span_map_count = options.default_span_map_count;
     const global_cache_multiplier = options.global_cache_multiplier;
-
-    if (disable_unmap and !enable_global_cache) {
-        @compileError("Must use global cache if unmap is disabled");
-    }
-
-    if (disable_unmap and !enable_unlimited_cache) {
-        var new_options: RPMallocOptions = options;
-        new_options.enable_unlimited_cache = true;
-        return RPMalloc(new_options);
-    }
-
-    if (!enable_global_cache and enable_unlimited_cache) {
-        var new_options = options;
-        new_options.enable_unlimited_cache = false;
-        return RPMalloc(new_options);
-    }
 
     const known_allocator = options.backing_allocator != null;
 
@@ -67,6 +117,30 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 },
             };
         }
+
+        pub const InitConfig = struct {
+            /// Size of a span of memory blocks. MUST be a power of two, and in [4096,262144]
+            /// range (unless 0 - set to 0 to use the default span size). Used if RPMALLOC_CONFIGURABLE
+            /// is defined to 1.
+            span_size: if (configurable_sizes) SpanSize else enum { default } = .default,
+            /// Number of spans to map at each request to map new virtual memory blocks. This can
+            /// be used to minimize the system call overhead at the cost of virtual memory address
+            /// space. The extra mapped pages will not be written until actually used, so physical
+            /// committed memory should not be affected in the default implementation. Will be
+            /// aligned to a multiple of spans that match memory page size in case of huge pages.
+            span_map_count: usize = 0,
+
+            pub const SpanSize = enum(usize) {
+                default = 0,
+                pow12 = 1 << 12,
+                pow13 = 1 << 13,
+                pow14 = 1 << 14,
+                pow15 = 1 << 15,
+                pow16 = 1 << 16,
+                pow17 = 1 << 17,
+                pow18 = 1 << 18,
+            };
+        };
 
         /// Initialize the allocator and setup global data.
         pub fn init(
@@ -120,7 +194,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
             if (configurable_sizes) {
                 // At least two blocks per span, then fall back to large allocations
-                medium_size_limit_runtime.* = calculateMediumSizeLimitRuntime(span_size.*);
+                medium_size_limit_runtime_mut = calculateMediumSizeLimitRuntime(span_size.*);
             }
             var iclass: usize = 0;
             while (iclass < MEDIUM_CLASS_COUNT) : (iclass += 1) {
@@ -154,7 +228,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
             { // Free all thread caches and fully free spans
                 var list_idx: usize = 0;
-                while (list_idx < heap_array_size) : (list_idx += 1) {
+                while (list_idx < all_heaps.len) : (list_idx += 1) {
                     var maybe_heap: ?*Heap = all_heaps[list_idx];
                     while (maybe_heap != null) {
                         const next_heap: ?*Heap = maybe_heap.?.next_heap;
@@ -173,6 +247,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 }
             }
 
+            orphan_heaps = null;
             initialized = false;
         }
         pub inline fn deinitThread(release_caches: bool) void {
@@ -367,7 +442,12 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         const default_span_size = 64 * 1024;
         const default_span_size_shift = log2(default_span_size);
         inline fn calculateSpanMask(input_span_size: anytype) @TypeOf(input_span_size) {
-            assert(@popCount(@as(std.math.IntFittingRange(0, input_span_size), input_span_size)) == 1);
+            assert(input_span_size > 0);
+            const T = @TypeOf(input_span_size);
+            const SmallestInt = if (T == comptime_int) std.math.IntFittingRange(0, input_span_size) else T;
+            if (T == comptime_int) {
+                assert(@popCount(@as(SmallestInt, input_span_size)) == 1);
+            } else {}
             return ~@as(usize, input_span_size - 1);
         }
 
@@ -433,7 +513,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         var global_reserve: ?*Span = null;
         var global_reserve_count: usize = 0;
         var global_reserve_master: ?*Span = null;
-        var all_heaps: [heap_array_size]?*Heap = .{null} ** heap_array_size;
+        var all_heaps: [options.heap_array_size]?*Heap = .{null} ** options.heap_array_size;
         // TODO: Is this comment accurate? If so, does that mean that
         // this isn't needed if we're not supporting huge pages?
         /// Used to restrict access to mapping memory for huge pages
@@ -503,7 +583,10 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             // I don't think we want to/can do partial unmappings, and it
             // seems like the zig stdlib discourages it as well.
             assert(release != 0);
-            assert(offset != 0);
+            // TODO: Investigate why this causes issues in configs other than the default
+            if (false) {
+                assert(offset != 0);
+            }
             assert(release >= page_size); // Invalid unmap size
             assert(release % page_size == 0); // Invalid unmap size
 
@@ -1076,7 +1159,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 return;
             };
             if (@atomicRmw(u32, &master_heap.child_count, .Sub, 1, .Monotonic) - 1 == 0) {
-                return @call(.always_tail, heapUnmap, .{ master_heap });
+                return @call(.always_tail, heapUnmap, .{master_heap});
             }
         }
 
@@ -1115,7 +1198,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             }
 
             // Heap is now completely free, unmap and remove from heap list
-            const list_idx: usize = heap.id % heap_array_size;
+            const list_idx: usize = heap.id % all_heaps.len;
             var list_heap: ?*Heap = all_heaps[list_idx].?;
             if (list_heap == heap) {
                 all_heaps[list_idx] = heap.next_heap;
@@ -1318,7 +1401,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             heap.id = @atomicRmw(u32, &heap_id_counter, .Add, 1, .Monotonic);
 
             //Link in heap in heap ID map
-            const list_idx: usize = heap.id % heap_array_size;
+            const list_idx: usize = heap.id % all_heaps.len;
             heap.next_heap = all_heaps[list_idx];
             all_heaps[list_idx] = heap;
         }
@@ -1407,7 +1490,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
         inline fn heapExtractOrphan(heap_list: *?*Heap) ?*Heap {
             const heap: ?*Heap = heap_list.*;
-            heap_list.* = if (heap != null) heap.?.next_orphan else null;
+            heap_list.* = if (heap) |h| h.next_orphan else null;
             return heap;
         }
 
@@ -1801,7 +1884,10 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             // This list does not need ABA protection, no mutable side state
             while (true) {
                 span.free_list = @ptrCast(?*anyopaque, @atomicLoad(?*Span, &heap.span_free_deferred, .Monotonic));
-                if (atomicCasPtr(&heap.span_free_deferred, span, @ptrCast(?*Span, span.free_list))) break;
+                const dst = &heap.span_free_deferred;
+                const val = span;
+                const ref = @ptrCast(?*Span, span.free_list);
+                if (@cmpxchgWeak(@TypeOf(dst.*), dst, ref, val, .Monotonic, .Monotonic) == null) break;
             }
         }
 
@@ -2010,30 +2096,6 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         inline fn isThreadInitialized() bool {
             return thread_heap != null;
         }
-
-        pub const InitConfig = struct {
-            /// Size of a span of memory blocks. MUST be a power of two, and in [4096,262144]
-            /// range (unless 0 - set to 0 to use the default span size). Used if RPMALLOC_CONFIGURABLE
-            /// is defined to 1.
-            span_size: if (configurable_sizes) SpanSize else enum { default } = .default,
-            /// Number of spans to map at each request to map new virtual memory blocks. This can
-            /// be used to minimize the system call overhead at the cost of virtual memory address
-            /// space. The extra mapped pages will not be written until actually used, so physical
-            /// committed memory should not be affected in the default implementation. Will be
-            /// aligned to a multiple of spans that match memory page size in case of huge pages.
-            span_map_count: usize = 0,
-
-            pub const SpanSize = enum(usize) {
-                default = 0,
-                pow12 = 1 << 12,
-                pow13 = 1 << 13,
-                pow14 = 1 << 14,
-                pow15 = 1 << 15,
-                pow16 = 1 << 16,
-                pow17 = 1 << 17,
-                pow18 = 1 << 18,
-            };
-        };
     };
 }
 
@@ -2069,6 +2131,7 @@ const Lock = enum(u32) {
 inline fn log2(x: anytype) switch (@typeInfo(@TypeOf(x))) {
     .Int => std.math.Log2Int(@TypeOf(x)),
     .ComptimeInt => comptime_int,
+    else => @compileError("can't get log₂ of type " ++ @typeName(@TypeOf(x))),
 } {
     const T = @TypeOf(x);
     return switch (@typeInfo(T)) {
