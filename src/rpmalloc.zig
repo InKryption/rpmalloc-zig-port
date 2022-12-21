@@ -130,19 +130,19 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 adjustSizeClass(SMALL_CLASS_COUNT + iclass, &global_size_classes, span_size);
             }
 
-            try threadInitialize(@returnAddress()); // initialise this thread after everything else is set up.
+            try threadInitialize(); // initialise this thread after everything else is set up.
         }
         pub inline fn initThread() error{OutOfMemory}!void {
             comptime if (builtin.single_threaded) return;
             assert(getThreadId() != main_thread_id);
             assert(!isThreadInitialized());
-            try threadInitialize(@returnAddress());
+            try threadInitialize();
         }
 
         /// Finalize the allocator
         pub fn deinit() void {
             assert(initialized);
-            threadFinalize(true, @returnAddress());
+            threadFinalize(true);
 
             if (global_reserve != null) {
                 _ = @atomicRmw(u32, &global_reserve_master.?.remaining_spans, .Sub, @intCast(u32, global_reserve_count), .Monotonic);
@@ -150,7 +150,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 global_reserve_count = 0;
                 global_reserve = null;
             }
-            releaseLock(&global_lock); // this is just to set the lock back to its initial state
+            @atomicStore(Lock, &global_lock, .unlocked, .Release); // TODO: Is unconditionally setting this OK?
 
             { // Free all thread caches and fully free spans
                 var list_idx: usize = 0;
@@ -159,7 +159,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     while (maybe_heap != null) {
                         const next_heap: ?*Heap = maybe_heap.?.next_heap;
                         maybe_heap.?.finalize = 1;
-                        heapGlobalFinalize(maybe_heap.?, @returnAddress());
+                        heapGlobalFinalize(maybe_heap.?);
                         maybe_heap = next_heap;
                     }
                 }
@@ -354,7 +354,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
         const GlobalCache = extern struct {
             /// Cache lock
-            lock: u32, // atomic
+            lock: Lock, // atomic
             /// Cache count
             count: u32,
             /// Cached spans
@@ -424,7 +424,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         var heap_id_counter: u32 = 0; // atomic
 
         var global_span_cache = if (enable_global_cache) ([_]GlobalCache{.{
-            .lock = 0,
+            .lock = .unlocked,
             .count = 0,
             .span = undefined,
             .overflow = null,
@@ -437,7 +437,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         // TODO: Is this comment accurate? If so, does that mean that
         // this isn't needed if we're not supporting huge pages?
         /// Used to restrict access to mapping memory for huge pages
-        var global_lock: u32 = 0; // atomic
+        var global_lock: Lock = .unlocked; // atomic
         /// Orphaned heaps
         var orphan_heaps: ?*Heap = null;
 
@@ -645,7 +645,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 if (reserved_count > heap_reserve_count) {
                     // If huge pages or eager spam map count, the global reserve spin lock is held by caller, spanMap
                     if (options.enable_asserts) {
-                        assert(@atomicLoad(u32, &global_lock, .Monotonic) == 1); // Global spin lock not held as expected
+                        assert(@atomicLoad(Lock, &global_lock, .Monotonic) == .locked); // Global spin lock not held as expected
                     }
                     const remain_count: usize = reserved_count - heap_reserve_count;
                     reserved_count = heap_reserve_count;
@@ -671,7 +671,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             const use_global_reserve: bool = (page_size > span_size.*) or (span_map_count > heap_reserve_count);
             if (use_global_reserve) {
                 // If huge pages, make sure only one thread maps more memory to avoid bloat
-                acquireLock(&global_lock);
+                global_lock.acquire();
                 if (global_reserve_count >= span_count) {
                     var reserve_count: usize = if (heap.spans_reserved == 0) heap_reserve_count else span_count;
                     reserve_count = @min(reserve_count, global_reserve_count);
@@ -686,7 +686,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     }
                 }
             }
-            defer if (use_global_reserve) releaseLock(&global_lock);
+            defer if (use_global_reserve) global_lock.release();
 
             if (span == null) {
                 span = spanMapAlignedCount(heap, span_count);
@@ -891,8 +891,8 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         fn globalCacheFinalize(cache: *GlobalCache) void {
             comptime assert(enable_global_cache);
 
-            acquireLock(&cache.lock);
-            defer releaseLock(&cache.lock);
+            cache.lock.acquire();
+            defer cache.lock.release();
 
             for (@as([*]*Span, &cache.span)[0..cache.count]) |span| {
                 spanUnmap(span);
@@ -917,8 +917,8 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
             var insert_count: usize = count;
             {
-                acquireLock(&cache.lock);
-                defer releaseLock(&cache.lock);
+                cache.lock.acquire();
+                defer cache.lock.release();
 
                 if ((cache.count + insert_count) > cache_limit)
                     insert_count = cache_limit - cache.count;
@@ -952,13 +952,13 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     current_span.next = keep;
                     keep = current_span;
                 } else {
-                    spanUnmap(current_span, ret_addr);
+                    spanUnmap(current_span);
                 }
             }
 
             if (keep != null) {
-                acquireLock(&cache.lock);
-                defer releaseLock(&cache.lock);
+                cache.lock.acquire();
+                defer cache.lock.release();
 
                 var islot: usize = 0;
                 while (keep != null) {
@@ -993,8 +993,8 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             const cache: *GlobalCache = &global_span_cache[span_count - 1];
 
             var extract_count: usize = 0;
-            acquireLock(&cache.lock);
-            defer releaseLock(&cache.lock);
+            cache.lock.acquire();
+            defer cache.lock.release();
 
             const want = @intCast(u32, @min(count - extract_count, cache.count));
 
@@ -1412,9 +1412,9 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         }
 
         /// Allocate a new heap, potentially reusing a previously orphaned heap
-        inline fn heapAllocate(ret_addr: usize) ?*Heap {
-            acquireLock(&global_lock);
-            defer releaseLock(&global_lock);
+        inline fn heapAllocate() ?*Heap {
+            global_lock.acquire();
+            defer global_lock.release();
             const maybe_heap = heapExtractOrphan(&orphan_heaps) orelse heapAllocateNew();
             if (maybe_heap != null) heapCacheAdoptDeferred(maybe_heap.?, null);
             return maybe_heap;
@@ -1461,13 +1461,13 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             // If we are forcibly terminating with _exit the state of the
             // lock atomic is unknown and it's best to just go ahead and exit
             if (getThreadId() != main_thread_id) {
-                acquireLock(&global_lock);
+                global_lock.acquire();
             }
             heapOrphan(heap);
             // TODO: the original source does this unconditionally, despite
             // the lock being acquired conditionally, but I don't understand
             // why or whether it's a good idea to do this.
-            releaseLock(&global_lock);
+            global_lock.release();
         }
 
         inline fn heapFinalize(heap: *Heap) void {
@@ -2047,14 +2047,24 @@ inline fn atomicCasPtr(dst: anytype, val: @TypeOf(dst.*), ref: @TypeOf(dst.*)) b
     return @cmpxchgWeak(@TypeOf(dst.*), dst, ref, val, .Monotonic, .Monotonic) == null;
 }
 
-inline fn acquireLock(lock: *u32) void {
-    while (@cmpxchgWeak(u32, lock, 0, 1, .Acquire, .Monotonic) != null) {
-        std.atomic.spinLoopHint();
+const Lock = enum(u32) {
+    unlocked = 0,
+    locked = 1,
+
+    inline fn acquire(lock: *Lock) void {
+        while (@cmpxchgWeak(Lock, lock, .unlocked, .locked, .Acquire, .Monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
     }
-}
-inline fn releaseLock(lock: *u32) void {
-    @atomicStore(u32, lock, 0, .Release);
-}
+    inline fn release(lock: *Lock) void {
+        if (builtin.mode == .Debug) {
+            const old_value = @atomicRmw(Lock, lock, .Xchg, .unlocked, .Release);
+            assert(old_value == .locked);
+            return;
+        }
+        @atomicStore(Lock, lock, .unlocked, .Release);
+    }
+};
 
 const INVALID_POINTER = @intToPtr(*align(SMALL_GRANULARITY) anyopaque, std.mem.alignBackward(std.math.maxInt(usize), SMALL_GRANULARITY));
 const SIZE_CLASS_LARGE = SIZE_CLASS_COUNT;
