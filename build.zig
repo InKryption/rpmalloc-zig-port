@@ -54,29 +54,28 @@ pub fn build(b: *std.build.Builder) void {
         Isaac64,
     };
 
+    const bench_log_level = b.option(std.log.Level, "bench-log", "Log level for benchmark") orelse .debug;
     const bench_impl = b.option(BenchImpl, "bench", "Which allocator to benchmark") orelse .@"rp-zig";
-    const bench_prng = b.option(BenchPrng, "bench-prng", "Name of PRNG to use") orelse comptime blk: {
-        for (std.enums.values(BenchPrng)) |tag| {
-            const T = @field(std.rand, @tagName(tag));
-            if (T == std.rand.DefaultPrng) break :blk tag;
-        }
-        unreachable;
-    };
+    const bench_prng = b.option(BenchPrng, "bench-prng", "Name of PRNG to use");
 
     bench_exe_options.contents.writer().print(
         \\pub const impl = .{s};
-        \\pub const prng = .{s};
+        \\pub const prng: ?@TypeOf(.enum_literal) = {?s};
+        \\pub const log_level: @import("std").log.Level = .{s};
         \\
     , .{
         std.zig.fmtId(@tagName(bench_impl)),
-        @tagName(bench_prng),
+        if (bench_prng) |tag| switch (tag) {
+            inline else => |itag| "." ++ @tagName(itag),
+        } else null,
+        @tagName(bench_log_level),
     }) catch unreachable;
 
     const bench_exe_run = bench_exe_leo.run();
+    bench_exe_run.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         bench_exe_run.addArgs(args);
     }
-    bench_exe_run.step.dependOn(b.getInstallStep());
 
     const bench_exe_run_tls = b.step("bench", "Run the benchmark");
     bench_exe_run_tls.dependOn(&bench_exe_run.step);
