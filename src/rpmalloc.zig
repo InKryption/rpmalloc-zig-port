@@ -4,53 +4,66 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
 test {
-    try testRPMalloc(.{ .backing_allocator = &std.testing.allocator }, null, .{});
-    try testRPMalloc(.{ .backing_allocator = &std.testing.allocator }, null, .{});
-    try testRPMalloc(.{ .backing_allocator = null }, std.testing.allocator, .{});
-    try testRPMalloc(.{
-        .backing_allocator = &std.testing.allocator,
-        .configurable_sizes = true,
-    }, null, .{ .span_size = .pow12 });
+    comptime var options: RPMallocOptions = .{ .backing_allocator = null };
+    try testRPMalloc(options, std.testing.allocator, .{}, .{});
 
-    try testRPMalloc(.{
-        .backing_allocator = &std.testing.allocator,
-        .configurable_sizes = true,
-    }, null, .{ .span_size = .pow18 });
+    options.backing_allocator = &std.testing.allocator;
+    try testRPMalloc(options, null, .{}, .{});
+    try testRPMalloc(options, null, .{}, .{});
 
-    try testRPMalloc(.{
-        .backing_allocator = &std.testing.allocator,
-        .enable_thread_cache = true,
-        .enable_global_cache = false,
-    }, null, .{});
+    options.configurable_sizes = true;
+    try testRPMalloc(options, null, .{ .span_size = .pow12 }, .{});
+    try testRPMalloc(options, null, .{ .span_size = .pow18 }, .{});
 
-    try testRPMalloc(.{
-        .backing_allocator = &std.testing.allocator,
-        .enable_thread_cache = false,
-        .enable_global_cache = false,
-    }, null, .{});
+    options.configurable_sizes = false;
+    options.global_cache = false;
+    try testRPMalloc(options, null, .{}, .{});
+
+    options.thread_cache = false;
+    try testRPMalloc(options, null, .{}, .{});
 }
 
 fn testRPMalloc(
     comptime options: RPMallocOptions,
     ally: if (options.backing_allocator != null) ?noreturn else Allocator,
     init_config: RPMalloc(options).InitConfig,
+    comptime extra: struct {
+        min_align: comptime_int = 1,
+        max_align: comptime_int = 16,
+    },
 ) !void {
+    const min_align = extra.min_align;
+    const max_align = extra.max_align;
+
+    // powers of two
+    assert(min_align > 0 and @popCount(@as(std.math.IntFittingRange(0, min_align), min_align)) == 1);
+    assert(max_align > 0 and @popCount(@as(std.math.IntFittingRange(0, max_align), max_align)) == 1);
+
     const Rp = RPMalloc(options);
     try Rp.init(ally, init_config);
     defer Rp.deinit();
 
-    var list = std.ArrayListAligned(u8, 64).init(Rp.allocator());
-    defer list.deinit();
+    comptime var alignment = min_align;
+    inline while (alignment <= max_align) : (alignment *= 2) {
+        var list = std.ArrayListAligned(u8, alignment).init(Rp.allocator());
+        defer list.deinit();
 
-    try list.append(33);
-    try list.appendNTimes(71, 22);
-    list.shrinkAndFree(2);
-    try list.ensureUnusedCapacity(1024 * 64);
-    list.appendSliceAssumeCapacity(&[1]u8{96} ** (1024 * 64));
-    list.shrinkAndFree(3);
-    var i: u32 = 1;
-    while (i < std.math.maxInt(u32)) : (i *|= 2) {
-        try list.append(@intCast(u8, (i - 1) % std.math.maxInt(u8)));
+        try list.append(33);
+        try list.appendNTimes(71, 22);
+        list.shrinkAndFree(2);
+        try list.ensureUnusedCapacity(1024 * 64);
+        list.appendSliceAssumeCapacity(&[1]u8{96} ** (1024 * 64));
+        list.shrinkAndFree(3);
+        var i: u32 = 1;
+        while (i < std.math.maxInt(u32)) : (i *|= 2) {
+            try list.append(@intCast(u8, (i - 1) % std.math.maxInt(u8)));
+        }
+
+        // brief check for any obvious memory corruption
+        try list.resize(6);
+        try std.testing.expectEqualSlices(u8, list.items, &.{ 33, 71, 96, 0, 1, 3 });
+        try list.appendNTimes(11, 1024);
+        try std.testing.expectEqualSlices(u8, list.items, &[_]u8{ 33, 71, 96, 0, 1, 3 } ++ [_]u8{11} ** 1024);
     }
 }
 
@@ -59,15 +72,15 @@ pub const RPMallocOptions = struct {
     /// overhead due to some size calculations not being compile time constants
     configurable_sizes: bool = false,
     /// Enable per-thread cache
-    enable_thread_cache: bool = true,
+    thread_cache: bool = true,
     /// Enable global cache shared between all threads, requires thread cache
-    enable_global_cache: bool = true,
+    global_cache: bool = true,
     /// Enable some slightly more expensive safety checks.
-    enable_asserts: bool = std.debug.runtime_safety,
+    assertions: bool = std.debug.runtime_safety,
     /// Disable unmapping memory pages (also enables unlimited cache)
-    disable_unmap: bool = false,
+    never_unmap: bool = false,
     /// Enable unlimited global cache (no unmapping until finalization)
-    enable_unlimited_cache: bool = false,
+    unlimited_cache: bool = false,
     /// Default number of spans to map in call to map more virtual memory (default values yield 4MiB here)
     default_span_map_count: usize = 64,
     /// Size of heap hashmap
@@ -81,26 +94,26 @@ pub const RPMallocOptions = struct {
 pub fn RPMalloc(comptime options: RPMallocOptions) type {
     const configurable_sizes = options.configurable_sizes;
 
-    if (options.disable_unmap and !options.enable_global_cache) {
+    if (options.never_unmap and !options.global_cache) {
         @compileError("Must use global cache if unmap is disabled");
     }
 
-    if (options.disable_unmap and !options.enable_unlimited_cache) {
+    if (options.never_unmap and !options.unlimited_cache) {
         var new_options: RPMallocOptions = options;
-        new_options.enable_unlimited_cache = true;
+        new_options.unlimited_cache = true;
         return RPMalloc(new_options);
     }
 
-    if (!options.enable_global_cache and options.enable_unlimited_cache) {
+    if (!options.global_cache and options.unlimited_cache) {
         var new_options = options;
-        new_options.enable_unlimited_cache = false;
+        new_options.unlimited_cache = false;
         return RPMalloc(new_options);
     }
 
-    const enable_thread_cache = options.enable_thread_cache;
-    const enable_global_cache = options.enable_global_cache;
-    const disable_unmap = options.disable_unmap;
-    const enable_unlimited_cache = options.enable_unlimited_cache;
+    const enable_thread_cache = options.thread_cache;
+    const enable_global_cache = options.global_cache;
+    const never_unmap = options.never_unmap;
+    const enable_unlimited_cache = options.unlimited_cache;
     const default_span_map_count = options.default_span_map_count;
     const global_cache_multiplier = options.global_cache_multiplier;
 
@@ -267,7 +280,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 len,
             ) orelse return null;
 
-            if (options.enable_asserts) {
+            if (options.assertions) {
                 const usable_size = usableSize(result_ptr);
                 assert(len <= usable_size);
             }
@@ -279,7 +292,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
             const usable_size = usableSize(buf.ptr);
             assert(buf.len <= usable_size);
-            if (options.enable_asserts) {
+            if (options.assertions) {
                 assert(std.mem.isAligned(@ptrToInt(buf.ptr), std.math.shl(usize, 1, buf_align)));
             }
 
@@ -288,7 +301,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         fn free(state_ptr: *anyopaque, buf: []u8, buf_align: u8, ret_addr: usize) void {
             _ = state_ptr;
             _ = ret_addr;
-            if (options.enable_asserts) {
+            if (options.assertions) {
                 const usable_size = usableSize(buf.ptr);
                 assert(buf.len <= usable_size);
                 assert(std.mem.isAligned(@ptrToInt(buf.ptr), std.math.shl(usize, 1, buf_align)));
@@ -487,6 +500,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
         /// Number of spans to map in each map call
         var span_map_count: usize = 0;
+
         /// Number of spans to keep reserved in each heap
         var heap_reserve_count: usize = 0;
         var global_size_classes: [SIZE_CLASS_COUNT]SizeClass = blk: {
@@ -596,7 +610,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 release += span_size.*;
             }
 
-            if (!disable_unmap) {
+            if (!never_unmap) {
                 backing_allocator.rawFree(@ptrCast([*]u8, address)[0..release], page_size_shift, @returnAddress());
             }
         }
@@ -727,7 +741,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 // then the assumed precondition of this branch would indicate that it is never allowed to happen anyways.
                 if (reserved_count > heap_reserve_count) {
                     // If huge pages or eager spam map count, the global reserve spin lock is held by caller, spanMap
-                    if (options.enable_asserts) {
+                    if (options.assertions) {
                         assert(@atomicLoad(Lock, &global_lock, .Monotonic) == .locked); // Global spin lock not held as expected
                     }
                     const remain_count: usize = reserved_count - heap_reserve_count;
@@ -1096,7 +1110,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 cache.overflow = current_span.next;
             }
 
-            if (options.enable_asserts) {
+            if (options.assertions) {
                 for (span[0..extract_count]) |span_elem| {
                     assert(span_elem.span_count == span_count);
                 }
@@ -1598,7 +1612,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     span_cache.count = 0;
                 }
             }
-            if (options.enable_asserts) {
+            if (options.assertions) {
                 assert(@atomicLoad(?*Span, &heap.span_free_deferred, .Monotonic) == null); // Heaps still active during finalization
             }
         }
@@ -1761,7 +1775,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 // and size aligned to span header size multiples is less than size + alignment,
                 // then use natural alignment of blocks to provide alignment
                 const multiple_size: usize = if (size != 0) (size + (SPAN_HEADER_SIZE - 1)) & ~@as(usize, SPAN_HEADER_SIZE - 1) else SPAN_HEADER_SIZE;
-                if (options.enable_asserts) {
+                if (options.assertions) {
                     assert(multiple_size % SPAN_HEADER_SIZE == 0); // Failed alignment calculation
                 }
                 if (multiple_size <= (size + alignment)) {
@@ -1793,7 +1807,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             // or greater, since the span header will push alignment more than one
             // span size away from span start (thus causing pointer mask to give us
             // an invalid span start on free)
-            if (options.enable_asserts) {
+            if (options.assertions) {
                 assert(alignment & align_mask == 0);
                 assert(alignment < span_size.*);
             }
@@ -1858,7 +1872,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         /// Deallocate the given small/medium memory block in the current thread local heap
         inline fn deallocateDirectSmallOrMedium(span: *Span, block: *align(SMALL_GRANULARITY) anyopaque) void {
             const heap: *Heap = span.heap;
-            if (!builtin.single_threaded and options.enable_asserts) {
+            if (!builtin.single_threaded and options.assertions) {
                 assert(heap.finalize != 0 or heap.owner_thread == 0 or heap.owner_thread == getThreadId()); // Internal failure
             }
             // Add block to free list
@@ -1922,22 +1936,21 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             }
         }
 
-        inline fn deallocateSmallOrMedium(span: *Span, p_init: *align(SMALL_GRANULARITY) anyopaque) void {
-            var p = p_init;
-            if (span.flags.aligned_blocks) {
+        inline fn deallocateSmallOrMedium(span: *Span, ptr: *align(SMALL_GRANULARITY) anyopaque) void {
+            const block = if (span.flags.aligned_blocks) blk: {
                 // Realign pointer to block start
                 const blocks_start: *align(SMALL_GRANULARITY) anyopaque = @ptrCast([*]align(SMALL_GRANULARITY) u8, span) + SPAN_HEADER_SIZE;
-                const block_offset = @ptrToInt(p) - @ptrToInt(blocks_start);
+                const block_offset = @ptrToInt(ptr) - @ptrToInt(blocks_start);
                 const offset_mod_size = @intCast(u32, block_offset % span.block_size);
-                p = ptrAndAlignCast(*align(SMALL_GRANULARITY) anyopaque, @ptrCast([*]u8, p) - offset_mod_size);
-            }
+                break :blk ptrAndAlignCast(*align(SMALL_GRANULARITY) anyopaque, @ptrCast([*]u8, ptr) - offset_mod_size);
+            } else ptr;
 
             // Check if block belongs to this heap or if deallocation should be deferred
             const defer_dealloc: bool = span.heap.finalize == 0 and (if (builtin.single_threaded) false else span.heap.owner_thread != getThreadId());
             if (!defer_dealloc) {
-                deallocateDirectSmallOrMedium(span, p);
+                deallocateDirectSmallOrMedium(span, block);
             } else {
-                deallocateDeferSmallOrMedium(span, p);
+                deallocateDeferSmallOrMedium(span, block);
             }
         }
 
@@ -1972,7 +1985,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 } else { //SPAN_FLAG_SUBSPAN
                     const master = ptrAndAlignCast(*Span, @ptrCast([*]u8, span) - (span.offset_from_master * span_size.*));
                     heap.span_reserve_master = master;
-                    if (options.enable_asserts) {
+                    if (options.assertions) {
                         assert(master.flags.master); // Span flag corrupted
                         assert(@atomicLoad(u32, &master.remaining_spans, .Monotonic) >= span.span_count); // Master span count corrupted
                     }
