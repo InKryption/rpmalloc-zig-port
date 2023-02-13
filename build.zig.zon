@@ -1,0 +1,5 @@
+.{
+    .name = "rpmalloc-zig-port",
+    .version = "0.1.0",
+    .depdendencies = .{},
+}

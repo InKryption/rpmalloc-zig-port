@@ -1,8 +1,13 @@
 const std = @import("std");
 
 pub fn build(b: *std.build.Builder) void {
-    const mode = b.standardReleaseOptions();
     const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    b.addModule(.{
+        .name = "rpmalloc",
+        .source_file = .{ .path = "src/rpmalloc.zig" },
+    });
 
     const link_libc = b.option(bool, "link-c", "Force generated executables to link to C") orelse false;
     const options = .{
@@ -19,20 +24,26 @@ pub fn build(b: *std.build.Builder) void {
         }
     }.setOptions;
 
-    const unit_tests_leo = b.addTest("src/rpmalloc.zig");
-    unit_tests_leo.setTarget(target);
-    unit_tests_leo.setBuildMode(mode);
+    const unit_tests_leo = b.addTest(.{
+        .root_source_file = .{ .path = "src/rpmalloc.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
     setOptions(unit_tests_leo, options);
     if (link_libc) unit_tests_leo.linkLibC();
 
     const unit_tests_tls = b.step("unit-tests", "Run the unit tests");
     unit_tests_tls.dependOn(&unit_tests_leo.step);
 
-    const bench_exe_leo = b.addExecutable("bench", "benchmark/main.zig");
-    bench_exe_leo.setTarget(target);
-    bench_exe_leo.setBuildMode(mode);
+    // const bench_exe_leo = b.addExecutable("bench", "benchmark/main.zig");
+    const bench_exe_leo = b.addExecutable(.{
+        .name = "bench",
+        .root_source_file = .{ .path = "benchmark/main.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
     setOptions(bench_exe_leo, options);
-    bench_exe_leo.addPackagePath("rpmalloc", "src/rpmalloc.zig");
+    bench_exe_leo.addAnonymousModule("rpmalloc", .{ .source_file = .{ .path = "src/rpmalloc.zig" } });
     if (link_libc) bench_exe_leo.linkLibC();
     bench_exe_leo.install();
 
