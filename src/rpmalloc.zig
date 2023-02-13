@@ -198,9 +198,9 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             if (configurable_sizes) {
                 globalSmallSizeClassesInit(&global_size_classes, span_size);
             } else if (comptime builtin.mode == .Debug) {
-                var expected: [SIZE_CLASS_COUNT]SizeClass = std.mem.zeroes([SIZE_CLASS_COUNT]SizeClass);
-                globalSmallSizeClassesInit(&expected, span_size);
-                for (global_size_classes[0..SMALL_CLASS_COUNT]) |sz_class, i| {
+                comptime var expected: [SIZE_CLASS_COUNT]SizeClass = std.mem.zeroes([SIZE_CLASS_COUNT]SizeClass);
+                comptime globalSmallSizeClassesInit(&expected, span_size);
+                inline for (global_size_classes[0..SMALL_CLASS_COUNT]) |sz_class, i| {
                     assert(std.meta.eql(sz_class, expected[i]));
                 }
             }
@@ -1422,7 +1422,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
         inline fn heapOrphan(heap: *Heap) void {
             if (!builtin.single_threaded) {
-                heap.owner_thread = std.math.maxInt(usize);
+                heap.owner_thread = std.math.maxInt(ThreadId);
             }
             const heap_list: *?*Heap = &orphan_heaps;
             heap.next_orphan = heap_list.*;
