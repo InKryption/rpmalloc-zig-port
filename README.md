@@ -6,11 +6,30 @@ This project is under development, does not guarantee a stable API and lacks doc
 Contributions, in the form of PRs and relevant resources, are greatly appreciated.
 
 ## Usage
-It's quite trivial to use, just add some code along the lines of
+If you cloned the repository, or vendor it as a git submodule or similar, you can just add the main source file as a module like so:
 ```zig
-exe.addPackagePath("rpmalloc", "path/to/rpmalloc/src/rpmalloc.zig");
+exe.addAnonymousModule("rpmalloc", .{ .source_file = .{ .path = "<path to repo>/src/rpmalloc.zig" } });
 ```
-to your build.zig, and then import it and use like so:
+However, if you want to use the zig package manager, the recommended process (at the time of writing) is as follows:
+1. Get the SHA of the commit you want to depend on.
+2. Make sure you have something akin to the following in your build.zig.zon file:
+```zig
+    .dependencies = .{
+        // -- snip --
+        .@"rpmalloc-zig-port" = .{
+            .url = "https://github.com/InKryption/rpmalloc-zig-port/archive/<commit SHA>.tar.gz",
+            .hash = <hash>, // you can get the expected value by running `zig build` while omitting this field.
+        },
+    },
+```
+3. Add something akin to the following to your build.zig file:
+```zig
+    const rpmalloc_dep = b.dependency("rpmalloc-zig-port", .{});
+    const rpmalloc_module = rpmalloc_dep.module("rpmalloc");
+    exe.addModule("rpmalloc", rpmalloc_module);
+```
+
+and then import and use it:
 ```zig
 const rpmalloc = @import("rpmalloc");
 const Rp = rpmalloc.RPMalloc(.{});
@@ -23,7 +42,7 @@ pub fn main() !void {
     // -- snip --
 }
 ```
-Although it should be clear from the example, I'll note that this allocator is indeed a singleton, much like in the original C source, with an important distinction being that you can concurrently have different permutations based on the configuration.
+It should be noted that this allocator is indeed a singleton, much like in the original C source, with an important distinction being that you can concurrently have different permutations based on the configuration.
 
 ## Notes
 * There are a good few TODO comments in the code, comprised mostly of uncertanties on as to the benefits or semantics of certain parts of the code.
