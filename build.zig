@@ -4,9 +4,8 @@ pub fn build(b: *std.build.Builder) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    b.addModule(.{
-        .name = "rpmalloc",
-        .source_file = .{ .path = "src/rpmalloc.zig" },
+    const rpmalloc_mod = b.addModule("rpmalloc", .{
+        .source_file = std.Build.FileSource.relative("src/rpmalloc.zig"),
     });
 
     const link_libc = b.option(bool, "link-c", "Force generated executables to link to C") orelse false;
@@ -43,7 +42,7 @@ pub fn build(b: *std.build.Builder) void {
         .optimize = optimize,
     });
     setOptions(bench_exe_leo, options);
-    bench_exe_leo.addAnonymousModule("rpmalloc", .{ .source_file = .{ .path = "src/rpmalloc.zig" } });
+    bench_exe_leo.addModule("rpmalloc", rpmalloc_mod);
     if (link_libc) bench_exe_leo.linkLibC();
     bench_exe_leo.install();
 

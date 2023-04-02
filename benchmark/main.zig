@@ -30,7 +30,7 @@ pub fn main() !void {
             const ArgName = comptime ArgName: {
                 const old_fields = @typeInfo(std.meta.FieldEnum(CmdArgs)).Enum.fields;
                 var fields: [old_fields.len]std.builtin.Type.EnumField = old_fields[0..].*;
-                for (fields) |*field| field.name = replaceScalarComptime(field.name, '_', '-');
+                for (&fields) |*field| field.name = replaceScalarComptime(field.name, '_', '-');
                 break :ArgName @Type(.{ .Enum = std.builtin.Type.Enum{
                     .tag_type = std.math.IntFittingRange(0, fields.len - 1),
                     .fields = &fields,
@@ -183,7 +183,7 @@ pub fn main() !void {
 inline fn replaceScalarComptime(comptime input: []const u8, comptime needle: u8, comptime replacement: u8) *const [input.len]u8 {
     comptime {
         var result: [input.len]u8 = input[0..].*;
-        for (result) |*c| {
+        for (&result) |*c| {
             if (c.* == needle) c.* = replacement;
         }
         return &result;
