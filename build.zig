@@ -44,7 +44,8 @@ pub fn build(b: *std.build.Builder) void {
     setOptions(bench_exe_leo, options);
     bench_exe_leo.addModule("rpmalloc", rpmalloc_mod);
     if (link_libc) bench_exe_leo.linkLibC();
-    bench_exe_leo.install();
+    b.installArtifact(bench_exe_leo);
+    
 
     const bench_exe_options = b.addOptions();
     bench_exe_leo.addOptions("build-options", bench_exe_options);
@@ -81,7 +82,7 @@ pub fn build(b: *std.build.Builder) void {
         @tagName(bench_log_level),
     }) catch unreachable;
 
-    const bench_exe_run = bench_exe_leo.run();
+    const bench_exe_run = b.addRunArtifact(bench_exe_leo);
     bench_exe_run.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         bench_exe_run.addArgs(args);
