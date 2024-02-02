@@ -1545,7 +1545,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     };
 
                     helper.releaseSpan(heap, &heap.span_cache, 0);
-                    for (heap.span_large_cache, 0..) |*span_large_cache, @"iclass-1"| {
+                    for (&heap.span_large_cache, 0..) |*span_large_cache, @"iclass-1"| {
                         helper.releaseSpan(heap, @as(*SpanCache, @ptrCast(span_large_cache)), @"iclass-1" + 1);
                     }
                 }
