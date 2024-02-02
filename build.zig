@@ -1,22 +1,22 @@
 const std = @import("std");
 
-pub fn build(b: *std.build.Builder) void {
+pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
     const rpmalloc_mod = b.addModule("rpmalloc", .{
-        .source_file = std.Build.FileSource.relative("src/rpmalloc.zig"),
+        .root_source_file = .{ .path = "src/rpmalloc.zig" },
     });
 
     const link_libc = b.option(bool, "link-c", "Force generated executables to link to C") orelse false;
     const options = .{
         .strip = b.option(bool, "strip", "Strip generated executables"),
         .sanitize_thread = b.option(bool, "sanitize-thread", "Enable thread sanitizer") orelse false,
-        .disable_sanitize_c = b.option(bool, "no-sanitize-c", "Disable C UBSAN") orelse false,
-        .valgrind_support = b.option(bool, "valgrind-support", "Force valgrind support on or off."),
+        .sanitize_c = !(b.option(bool, "no-sanitize-c", "Disable C UBSAN") orelse false),
+        .valgrind = b.option(bool, "valgrind-support", "Force valgrind support on or off."),
     };
     const setOptions = struct {
-        fn setOptions(leo: *std.build.LibExeObjStep, opts: @TypeOf(options)) void {
+        fn setOptions(leo: *std.Build.Module, opts: @TypeOf(options)) void {
             inline for (@typeInfo(@TypeOf(opts)).Struct.fields) |field| {
                 @field(leo, field.name) = @field(opts, field.name);
             }
@@ -28,7 +28,7 @@ pub fn build(b: *std.build.Builder) void {
         .target = target,
         .optimize = optimize,
     });
-    setOptions(unit_tests_leo, options);
+    setOptions(&unit_tests_leo.root_module, options);
     if (link_libc) unit_tests_leo.linkLibC();
 
     const unit_tests_tls = b.step("unit-tests", "Run the unit tests");
@@ -41,14 +41,14 @@ pub fn build(b: *std.build.Builder) void {
         .target = target,
         .optimize = optimize,
     });
-    setOptions(bench_exe_leo, options);
-    bench_exe_leo.addModule("rpmalloc", rpmalloc_mod);
+    setOptions(&bench_exe_leo.root_module, options);
+    bench_exe_leo.root_module.addImport("rpmalloc", rpmalloc_mod);
     if (link_libc) bench_exe_leo.linkLibC();
     b.installArtifact(bench_exe_leo);
     
 
     const bench_exe_options = b.addOptions();
-    bench_exe_leo.addOptions("build-options", bench_exe_options);
+    bench_exe_leo.root_module.addOptions("build-options", bench_exe_options);
     bench_exe_options.addOption(?comptime_int, "cmd_args_buffer_size", null);
 
     const BenchImpl = enum {
