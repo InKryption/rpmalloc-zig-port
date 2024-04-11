@@ -232,12 +232,12 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             threadFinalize(true);
 
             if (global_reserve != null) {
-                _ = @atomicRmw(u32, &global_reserve_master.?.remaining_spans, .Sub, @as(u32, @intCast(global_reserve_count)), .Monotonic);
+                _ = @atomicRmw(u32, &global_reserve_master.?.remaining_spans, .Sub, @as(u32, @intCast(global_reserve_count)), .monotonic);
                 global_reserve_master = null;
                 global_reserve_count = 0;
                 global_reserve = null;
             }
-            @atomicStore(Lock, &global_lock, .unlocked, .Release); // TODO: Is unconditionally setting this OK?
+            @atomicStore(Lock, &global_lock, .unlocked, .release); // TODO: Is unconditionally setting this OK?
 
             { // Free all thread caches and fully free spans
                 var list_idx: usize = 0;
@@ -719,7 +719,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             // TODO: Is there a reason for this to be atomic?
             // Intuitively it seems like there wouldn't be, since the span in question has presumably
             // just been mapped, and thus wouldn't be accessible by any other thread at present.
-            @atomicStore(u32, &span.remaining_spans, @as(u32, @intCast(total_span_count)), .Monotonic);
+            @atomicStore(u32, &span.remaining_spans, @as(u32, @intCast(total_span_count)), .monotonic);
         }
 
         /// Map an aligned set of spans, taking configured mapping granularity and the page size into account
@@ -742,7 +742,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 if (reserved_count > heap_reserve_count) {
                     // If huge pages or eager spam map count, the global reserve spin lock is held by caller, spanMap
                     if (options.assertions) {
-                        assert(@atomicLoad(Lock, &global_lock, .Monotonic) == .locked); // Global spin lock not held as expected
+                        assert(@atomicLoad(Lock, &global_lock, .monotonic) == .locked); // Global spin lock not held as expected
                     }
                     const remain_count: usize = reserved_count - heap_reserve_count;
                     reserved_count = heap_reserve_count;
@@ -827,7 +827,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             }
 
             std.debug.assert(span.span_count != 0);
-            const prev_remaining_spans: i64 = @atomicRmw(u32, &master.remaining_spans, .Sub, span.span_count, .Monotonic);
+            const prev_remaining_spans: i64 = @atomicRmw(u32, &master.remaining_spans, .Sub, span.span_count, .monotonic);
             if (prev_remaining_spans - span.span_count <= 0) {
                 // Everything unmapped, unmap the master span with release flag to unmap the entire range of the super span
                 assert(master.flags.master and master.flags.subspan); // Span flag corrupted
@@ -1045,7 +1045,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             var keep: ?*Span = null;
             for (span[insert_count..count]) |current_span| {
                 // Keep master spans that has remaining subspans to avoid dangling them
-                if (current_span.flags.master and (@atomicLoad(u32, &current_span.remaining_spans, .Monotonic) > current_span.span_count)) {
+                if (current_span.flags.master and (@atomicLoad(u32, &current_span.remaining_spans, .monotonic) > current_span.span_count)) {
                     current_span.next = keep;
                     keep = current_span;
                 } else {
@@ -1062,7 +1062,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     while (islot < cache.count) : (islot += 1) {
                         const current_span: *Span = cache.span[islot];
                         if (!current_span.flags.master or
-                            (current_span.flags.master and (@atomicLoad(u32, &current_span.remaining_spans, .Monotonic) <= current_span.span_count)))
+                            (current_span.flags.master and (@atomicLoad(u32, &current_span.remaining_spans, .monotonic) <= current_span.span_count)))
                         {
                             spanUnmap(current_span);
                             cache.span[islot] = keep.?;
@@ -1166,13 +1166,13 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
         fn heapUnmap(heap: *Heap) void {
             const master_heap = heap.master_heap orelse {
-                if (heap.finalize > 1 and @atomicLoad(u32, &heap.child_count, .Monotonic) == 0) {
+                if (heap.finalize > 1 and @atomicLoad(u32, &heap.child_count, .monotonic) == 0) {
                     const span: *Span = getSpanPtr(heap).?;
                     spanUnmap(span);
                 }
                 return;
             };
-            if (@atomicRmw(u32, &master_heap.child_count, .Sub, 1, .Monotonic) - 1 == 0) {
+            if (@atomicRmw(u32, &master_heap.child_count, .Sub, 1, .monotonic) - 1 == 0) {
                 return @call(.always_tail, heapUnmap, .{master_heap});
             }
         }
@@ -1412,7 +1412,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
             // TODO: In the original code this used a function which returned the old value of heap_id_counter plus 1,
             // and then also added one, which caused the first id to ever be assigned to be '2', instead of '0' like it is here.
             // Need to investigate whether this is in any way significant.
-            heap.id = @atomicRmw(u32, &heap_id_counter, .Add, 1, .Monotonic);
+            heap.id = @atomicRmw(u32, &heap_id_counter, .Add, 1, .monotonic);
 
             //Link in heap in heap ID map
             const list_idx: usize = heap.id % all_heaps.len;
@@ -1474,7 +1474,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 
             // Put extra heaps as orphans
             var num_heaps: usize = @max(remain_size / aligned_heap_size, request_heap_count);
-            @atomicStore(u32, &heap.child_count, @as(u32, @intCast(num_heaps - 1)), .Monotonic);
+            @atomicStore(u32, &heap.child_count, @as(u32, @intCast(num_heaps - 1)), .monotonic);
             var extra_heap: *Heap = @as(*Heap, @ptrCast(@as([*]align(@alignOf(Heap)) u8, @ptrCast(heap)) + aligned_heap_size));
             while (num_heaps > 1) {
                 heapInitialize(extra_heap);
@@ -1613,7 +1613,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 }
             }
             if (options.assertions) {
-                assert(@atomicLoad(?*Span, &heap.span_free_deferred, .Monotonic) == null); // Heaps still active during finalization
+                assert(@atomicLoad(?*Span, &heap.span_free_deferred, .monotonic) == null); // Heaps still active during finalization
             }
         }
 
@@ -1655,7 +1655,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                 span.?.used_count = span.?.free_list_limit;
 
                 // Swap in deferred free list if present
-                if (@atomicLoad(?*align(SMALL_GRANULARITY) anyopaque, &span.?.free_list_deferred, .Monotonic) != null) {
+                if (@atomicLoad(?*align(SMALL_GRANULARITY) anyopaque, &span.?.free_list_deferred, .monotonic) != null) {
                     spanExtractFreeListDeferred(span.?);
                 }
 
@@ -1897,11 +1897,11 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
         inline fn deallocateDeferFreeSpan(heap: *Heap, span: *Span) void {
             // This list does not need ABA protection, no mutable side state
             while (true) {
-                span.free_list = @alignCast(@as(?*anyopaque, @ptrCast(@atomicLoad(?*Span, &heap.span_free_deferred, .Monotonic))));
+                span.free_list = @alignCast(@as(?*anyopaque, @ptrCast(@atomicLoad(?*Span, &heap.span_free_deferred, .monotonic))));
                 const dst = &heap.span_free_deferred;
                 const val = span;
                 const ref = @as(?*Span, @ptrCast(span.free_list));
-                if (@cmpxchgWeak(@TypeOf(dst.*), dst, ref, val, .Monotonic, .Monotonic) == null) break;
+                if (@cmpxchgWeak(@TypeOf(dst.*), dst, ref, val, .monotonic, .monotonic) == null) break;
             }
         }
 
@@ -1987,7 +1987,7 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
                     heap.span_reserve_master = master;
                     if (options.assertions) {
                         assert(master.flags.master); // Span flag corrupted
-                        assert(@atomicLoad(u32, &master.remaining_spans, .Monotonic) >= span.span_count); // Master span count corrupted
+                        assert(@atomicLoad(u32, &master.remaining_spans, .monotonic) >= span.span_count); // Master span count corrupted
                     }
                 }
             } else {
@@ -2113,13 +2113,13 @@ pub fn RPMalloc(comptime options: RPMallocOptions) type {
 }
 
 inline fn atomicStorePtrRelease(dst: anytype, val: @TypeOf(dst.*)) void {
-    @atomicStore(@TypeOf(dst.*), dst, val, .Release);
+    @atomicStore(@TypeOf(dst.*), dst, val, .release);
 }
 inline fn atomicExchangePtrAcquire(dst: anytype, val: @TypeOf(dst.*)) @TypeOf(dst.*) {
-    return @atomicRmw(@TypeOf(dst.*), dst, .Xchg, val, .Acquire);
+    return @atomicRmw(@TypeOf(dst.*), dst, .Xchg, val, .acquire);
 }
 inline fn atomicCasPtr(dst: anytype, val: @TypeOf(dst.*), ref: @TypeOf(dst.*)) bool {
-    return @cmpxchgWeak(@TypeOf(dst.*), dst, ref, val, .Monotonic, .Monotonic) == null;
+    return @cmpxchgWeak(@TypeOf(dst.*), dst, ref, val, .monotonic, .monotonic) == null;
 }
 
 const Lock = enum(u32) {
@@ -2127,17 +2127,17 @@ const Lock = enum(u32) {
     locked = 1,
 
     inline fn acquire(lock: *Lock) void {
-        while (@cmpxchgWeak(Lock, lock, .unlocked, .locked, .Acquire, .Monotonic) != null) {
+        while (@cmpxchgWeak(Lock, lock, .unlocked, .locked, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
         }
     }
     inline fn release(lock: *Lock) void {
         if (builtin.mode == .Debug) {
-            const old_value = @atomicRmw(Lock, lock, .Xchg, .unlocked, .Release);
+            const old_value = @atomicRmw(Lock, lock, .Xchg, .unlocked, .release);
             assert(old_value == .locked);
             return;
         }
-        @atomicStore(Lock, lock, .unlocked, .Release);
+        @atomicStore(Lock, lock, .unlocked, .release);
     }
 };
 
